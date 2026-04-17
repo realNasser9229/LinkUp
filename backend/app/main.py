@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Dict, List
+from collections import defaultdict
+from typing import Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, FastAPI, WebSocket, WebSocketDisconnect
@@ -38,38 +39,119 @@ ws_router = APIRouter()
 class RoomState:
     def __init__(self) -> None:
         self.sockets: Dict[str, Dict[str, WebSocket]] = {}
-        self.names: Dict[str, Dict[str, str]] = {}
+        self.members: Dict[str, Dict[str, dict]] = {}
         self.history: Dict[str, List[dict]] = {}
+        self.pins: Dict[str, List[dict]] = {}
+        self.reactions: Dict[str, Dict[str, Dict[str, set]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
 
     def ensure(self, room: str) -> None:
         self.sockets.setdefault(room, {})
-        self.names.setdefault(room, {})
+        self.members.setdefault(room, {})
         self.history.setdefault(room, [])
+        self.pins.setdefault(room, [])
 
-    def presence(self, room: str) -> List[dict]:
+    def current_users(self, room: str) -> List[dict]:
         self.ensure(room)
-        users = [
-            {"client_id": client_id, "name": name, "status": "online"}
-            for client_id, name in self.names[room].items()
-        ]
-        users.sort(key=lambda x: x["name"].lower())
+        users = []
+        for client_id, info in self.members[room].items():
+            if client_id not in self.sockets[room]:
+                continue
+            users.append(
+                {
+                    "client_id": client_id,
+                    "name": info["name"],
+                    "joined_at": info["joined_at"],
+                }
+            )
+        users.sort(key=lambda u: (u["joined_at"], u["name"].lower()))
         return users
 
-    async def send(self, ws: WebSocket, payload: dict) -> None:
-        await ws.send_json(payload)
-
-    async def broadcast(self, room: str, payload: dict) -> None:
+    def register(self, room: str, client_id: str, name: str, ws: WebSocket) -> bool:
         self.ensure(room)
-        dead: List[str] = []
-        for client_id, ws in self.sockets[room].items():
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                dead.append(client_id)
+        is_new = client_id not in self.members[room]
+        if is_new:
+            self.members[room][client_id] = {"name": name, "joined_at": int(time.time() * 1000)}
+        else:
+            self.members[room][client_id]["name"] = name
+        self.sockets[room][client_id] = ws
+        return is_new
 
-        for client_id in dead:
-            self.sockets[room].pop(client_id, None)
-            self.names[room].pop(client_id, None)
+    def remove(self, room: str, client_id: str) -> None:
+        self.ensure(room)
+        self.sockets[room].pop(client_id, None)
+        self.members[room].pop(client_id, None)
+
+    def append_history(self, room: str, payload: dict) -> None:
+        self.ensure(room)
+        self.history[room].append(payload)
+        if len(self.history[room]) > 400:
+            self.history[room] = self.history[room][-400:]
+
+    def get_message_by_id(self, room: str, msg_id: str) -> Optional[dict]:
+        self.ensure(room)
+        for msg in self.history[room]:
+            if msg.get("msg_id") == msg_id:
+                return msg
+        return None
+
+    def build_pins(self, room: str) -> List[dict]:
+        self.ensure(room)
+        return self.pins[room][-50:]
+
+    def toggle_pin(self, room: str, msg_id: str) -> Optional[dict]:
+        self.ensure(room)
+        msg = self.get_message_by_id(room, msg_id)
+        if not msg:
+            return None
+
+        existing = next((p for p in self.pins[room] if p.get("msg_id") == msg_id), None)
+        if existing:
+            self.pins[room] = [p for p in self.pins[room] if p.get("msg_id") != msg_id]
+            return {"action": "unpinned", "message": msg}
+
+        pin_payload = {
+            "msg_id": msg["msg_id"],
+            "name": msg.get("name", "Guest"),
+            "text": msg.get("text", ""),
+            "client_id": msg.get("client_id", ""),
+            "time": msg.get("time", int(time.time() * 1000)),
+        }
+        self.pins[room].append(pin_payload)
+        return {"action": "pinned", "message": msg}
+
+    def toggle_reaction(self, room: str, msg_id: str, emoji: str, client_id: str) -> Optional[dict]:
+        self.ensure(room)
+        msg = self.get_message_by_id(room, msg_id)
+        if not msg:
+            return None
+
+        bucket = self.reactions[room][msg_id][emoji]
+        if client_id in bucket:
+            bucket.remove(client_id)
+        else:
+            bucket.add(client_id)
+
+        counts = {}
+        for e, users in self.reactions[room][msg_id].items():
+            counts[e] = len(users)
+
+        return {
+            "msg_id": msg_id,
+            "reactions": counts,
+        }
+
+    async def send_history(self, room: str, ws: WebSocket) -> None:
+        self.ensure(room)
+        await ws.send_json(
+            {
+                "kind": "history",
+                "room": room,
+                "messages": self.history[room][-150:],
+                "users": self.current_users(room),
+                "pins": self.build_pins(room),
+                "time": int(time.time() * 1000),
+            }
+        )
 
     async def send_presence(self, room: str) -> None:
         await self.broadcast(
@@ -77,44 +159,34 @@ class RoomState:
             {
                 "kind": "presence",
                 "room": room,
-                "users": self.presence(room),
+                "users": self.current_users(room),
                 "time": int(time.time() * 1000),
             },
         )
 
-    async def send_history(self, room: str, ws: WebSocket) -> None:
+    async def broadcast(self, room: str, payload: dict) -> None:
         self.ensure(room)
-        await self.send(
-            ws,
+        dead = []
+        for client_id, ws in self.sockets[room].items():
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                dead.append(client_id)
+        for client_id in dead:
+            self.remove(room, client_id)
+
+    async def system(self, room: str, text: str) -> None:
+        await self.broadcast(
+            room,
             {
-                "kind": "history",
+                "kind": "system",
+                "msg_id": "sys_" + uuid4().hex,
+                "name": "System",
+                "text": text,
                 "room": room,
-                "messages": self.history[room][-100:],
-                "users": self.presence(room),
                 "time": int(time.time() * 1000),
             },
         )
-
-    def register(self, room: str, client_id: str, name: str, ws: WebSocket) -> None:
-        self.ensure(room)
-        self.sockets[room][client_id] = ws
-        self.names[room][client_id] = name
-
-    def rename(self, room: str, client_id: str, name: str) -> None:
-        self.ensure(room)
-        if client_id in self.names[room]:
-            self.names[room][client_id] = name
-
-    def remove(self, room: str, client_id: str) -> None:
-        self.ensure(room)
-        self.sockets[room].pop(client_id, None)
-        self.names[room].pop(client_id, None)
-
-    def push_history(self, room: str, payload: dict) -> None:
-        self.ensure(room)
-        self.history[room].append(payload)
-        if len(self.history[room]) > 250:
-            self.history[room] = self.history[room][-250:]
 
 
 rooms = RoomState()
@@ -138,14 +210,17 @@ async def room_socket(websocket: WebSocket, room_id: str):
             except Exception:
                 data = {}
 
-            kind = data.get("kind", "message")
+            kind = str(data.get("kind") or "message")
             incoming_client_id = str(data.get("client_id") or client_id)
             incoming_name = str(data.get("name") or display_name).strip()[:24] or "Guest"
 
             if kind == "hello":
                 client_id = incoming_client_id
                 display_name = incoming_name
-                rooms.register(room_id, client_id, display_name, websocket)
+
+                is_new = rooms.register(room_id, client_id, display_name, websocket)
+                if is_new:
+                    await rooms.system(room_id, f"{display_name} joined.")
                 await rooms.send_history(room_id, websocket)
                 await rooms.send_presence(room_id)
                 continue
@@ -157,11 +232,10 @@ async def room_socket(websocket: WebSocket, room_id: str):
                 await rooms.send_presence(room_id)
                 continue
 
-            if client_id not in rooms.sockets[room_id]:
+            if client_id not in rooms.members[room_id]:
                 client_id = incoming_client_id
                 display_name = incoming_name
                 rooms.register(room_id, client_id, display_name, websocket)
-                await rooms.send_presence(room_id)
 
             if kind == "typing":
                 await rooms.broadcast(
@@ -176,23 +250,78 @@ async def room_socket(websocket: WebSocket, room_id: str):
                 )
                 continue
 
+            if kind == "pin":
+                msg_id = str(data.get("msg_id") or "")
+                result = rooms.toggle_pin(room_id, msg_id)
+                if not result:
+                    continue
+                await rooms.broadcast(
+                    room_id,
+                    {
+                        "kind": "pin_update",
+                        "action": result["action"],
+                        "message": result["message"],
+                        "pins": rooms.build_pins(room_id),
+                        "room": room_id,
+                        "time": int(time.time() * 1000),
+                    },
+                )
+                continue
+
+            if kind == "reaction":
+                msg_id = str(data.get("msg_id") or "")
+                emoji = str(data.get("emoji") or "👍").strip()[:4]
+                result = rooms.toggle_reaction(room_id, msg_id, emoji, client_id)
+                if not result:
+                    continue
+                await rooms.broadcast(
+                    room_id,
+                    {
+                        "kind": "reaction_update",
+                        "msg_id": result["msg_id"],
+                        "reactions": result["reactions"],
+                        "room": room_id,
+                        "time": int(time.time() * 1000),
+                    },
+                )
+                continue
+
+            text = str(data.get("text") or "").strip()
+            if not text:
+                continue
+
+            reply_to = data.get("reply_to")
+            reply_preview = None
+            if reply_to:
+                reply_msg = rooms.get_message_by_id(room_id, str(reply_to))
+                if reply_msg:
+                    reply_preview = {
+                        "msg_id": reply_msg.get("msg_id"),
+                        "name": reply_msg.get("name", "Guest"),
+                        "text": reply_msg.get("text", ""),
+                    }
+
             message = {
                 "kind": "message",
                 "msg_id": str(data.get("msg_id") or ("msg_" + uuid4().hex)),
                 "client_id": client_id,
                 "name": display_name,
-                "text": str(data.get("text") or "").strip(),
+                "text": text,
                 "room": room_id,
                 "time": int(data.get("time") or int(time.time() * 1000)),
+                "reply_to": reply_to,
+                "reply_preview": reply_preview,
+                "reactions": {},
+                "pinned": False,
             }
 
-            if not message["text"]:
-                continue
-
-            rooms.push_history(room_id, message)
+            rooms.append_history(room_id, message)
             await rooms.broadcast(room_id, message)
 
     except WebSocketDisconnect:
+        rooms.remove(room_id, client_id)
+        await rooms.send_presence(room_id)
+    except Exception:
         rooms.remove(room_id, client_id)
         await rooms.send_presence(room_id)
 
@@ -210,16 +339,15 @@ def page_html() -> str:
   <style>
     :root{
       --bg:#050812;
-      --panel:rgba(13, 19, 40, .88);
-      --panel2:rgba(18, 28, 55, .94);
+      --panel:rgba(12, 18, 37, .90);
+      --panel2:rgba(17, 26, 51, .96);
       --line:rgba(255,255,255,.08);
       --text:#eef3ff;
       --muted:#9aa8cf;
       --accent:#7b8cff;
       --accent2:#66efc0;
-      --danger:#ff6b7f;
       --shadow:0 30px 90px rgba(0,0,0,.42);
-      --radius:22px;
+      --radius:24px;
       color-scheme: dark;
     }
     *{box-sizing:border-box}
@@ -238,7 +366,7 @@ def page_html() -> str:
       min-height:100vh;
       padding:16px;
       display:grid;
-      grid-template-columns: 92px 286px minmax(0,1fr) 360px;
+      grid-template-columns: 92px 286px minmax(0,1fr) 380px;
       gap:16px;
     }
     .glass{
@@ -401,16 +529,21 @@ def page_html() -> str:
       background:var(--panel2);
     }
     .main-top{
+      position:sticky;
+      top:0;
+      z-index:10;
       padding:18px 20px;
       border-bottom:1px solid var(--line);
       display:flex;
-      align-items:center;
+      align-items:flex-start;
       justify-content:space-between;
       gap:14px;
+      background:rgba(17, 26, 51, .98);
+      backdrop-filter: blur(14px);
     }
     .titleblock h2{
       margin:0;
-      font-size:22px;
+      font-size:24px;
     }
     .titleblock p{
       margin:5px 0 0;
@@ -439,12 +572,12 @@ def page_html() -> str:
       border:1px solid rgba(255,255,255,.08);
       background:rgba(255,255,255,.03);
       border-radius:16px;
-      padding:10px 12px;
-      min-width:120px;
+      padding:12px 14px;
+      min-width:140px;
     }
     .stat b{
       display:block;
-      font-size:18px;
+      font-size:19px;
       margin-bottom:2px;
     }
     .stat span{
@@ -452,40 +585,75 @@ def page_html() -> str:
       font-size:12px;
     }
 
+    .topbar-tools{
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      justify-content:flex-end;
+      align-items:center;
+    }
+    .search{
+      width:min(360px, 52vw);
+      padding:12px 14px;
+      border-radius:14px;
+      border:1px solid rgba(255,255,255,.08);
+      background:#08111f;
+      color:var(--text);
+      outline:none;
+    }
+    .toolbtn{
+      border:none;
+      background:rgba(255,255,255,.06);
+      color:var(--text);
+      border:1px solid rgba(255,255,255,.06);
+      padding:12px 14px;
+      border-radius:14px;
+      cursor:pointer;
+    }
+    .toolbtn:hover{background:rgba(255,255,255,.09)}
+
+    .typing{
+      min-height:22px;
+      color:#c7d2ff;
+      font-size:12px;
+      padding:0 22px 8px;
+    }
+
     .messages{
       flex:1;
       overflow:auto;
-      padding:22px;
+      padding:24px;
       display:flex;
       flex-direction:column;
-      gap:12px;
+      gap:14px;
       scroll-behavior:smooth;
     }
     .msg{
       display:grid;
-      grid-template-columns:48px minmax(0,1fr);
-      gap:12px;
-      padding:16px;
-      border-radius:18px;
+      grid-template-columns:52px minmax(0,1fr);
+      gap:14px;
+      padding:18px;
+      border-radius:20px;
       border:1px solid rgba(255,255,255,.06);
       background:rgba(255,255,255,.025);
     }
     .msg:hover{background:rgba(255,255,255,.032)}
     .avatar{
-      width:48px;height:48px;border-radius:16px;
+      width:52px;height:52px;border-radius:18px;
       display:grid;
       place-items:center;
       background:linear-gradient(180deg, #7b8cff, #5361ff);
       color:#fff;
       font-weight:800;
       flex:0 0 auto;
+      box-shadow:0 10px 20px rgba(123,140,255,.16);
     }
     .head{
       display:flex;
       align-items:center;
       justify-content:space-between;
       gap:10px;
-      margin-bottom:4px;
+      margin-bottom:8px;
     }
     .name{
       display:flex;
@@ -503,13 +671,43 @@ def page_html() -> str:
     .text{
       white-space:pre-wrap;
       word-break:break-word;
-      line-height:1.6;
+      line-height:1.7;
       color:#eef2ff;
       font-size:15px;
     }
     .system{
       border-style:dashed;
       background:rgba(123,140,255,.07);
+    }
+    .replybox{
+      margin-bottom:10px;
+      padding:10px 12px;
+      border-radius:14px;
+      border-left:3px solid rgba(123,140,255,.75);
+      background:rgba(123,140,255,.08);
+      color:#d9e2ff;
+      font-size:12px;
+    }
+    .msg-actions{
+      display:flex;
+      gap:8px;
+      flex-wrap:wrap;
+      margin-top:12px;
+    }
+    .chipbtn{
+      border:none;
+      border-radius:999px;
+      padding:7px 10px;
+      cursor:pointer;
+      font-size:12px;
+      background:rgba(255,255,255,.05);
+      color:#e9eeff;
+      border:1px solid rgba(255,255,255,.06);
+    }
+    .chipbtn:hover{background:rgba(255,255,255,.09)}
+    .chipbtn.active{
+      background:rgba(123,140,255,.16);
+      border-color:rgba(123,140,255,.22);
     }
 
     .composer{
@@ -521,22 +719,22 @@ def page_html() -> str:
       display:flex;
       gap:12px;
       align-items:flex-end;
-      padding:14px;
-      border-radius:20px;
+      padding:16px;
+      border-radius:22px;
       background:#08111f;
       border:1px solid rgba(255,255,255,.06);
     }
     .composer textarea{
       flex:1;
       resize:none;
-      min-height:58px;
-      max-height:180px;
+      min-height:72px;
+      max-height:220px;
       background:transparent;
       color:var(--text);
       border:none;
       outline:none;
-      line-height:1.6;
-      padding:10px 10px;
+      line-height:1.65;
+      padding:12px 10px;
       font-size:15px;
     }
     .send{
@@ -548,6 +746,7 @@ def page_html() -> str:
       cursor:pointer;
       font-weight:700;
       box-shadow:0 14px 30px rgba(123,140,255,.20);
+      min-width:98px;
     }
     .send:hover{filter:brightness(1.04)}
 
@@ -591,22 +790,40 @@ def page_html() -> str:
     }
     .user{
       display:flex;
-      align-items:center;
+      align-items:flex-start;
       justify-content:space-between;
-      gap:8px;
-      padding:10px 12px;
-      border-radius:14px;
+      gap:10px;
+      padding:12px;
+      border-radius:16px;
       background:rgba(255,255,255,.03);
       border:1px solid rgba(255,255,255,.05);
     }
-    .user strong{font-size:13px}
-    .user span{font-size:12px;color:var(--muted)}
-    .typing{
-      min-height:22px;
-      color:#c7d2ff;
-      font-size:12px;
-      padding:0 22px 8px;
+    .user-main{
+      min-width:0;
+      flex:1;
     }
+    .user strong{
+      font-size:13px;
+      display:flex;
+      align-items:center;
+      gap:6px;
+      margin-bottom:2px;
+    }
+    .user span{
+      font-size:12px;
+      color:var(--muted);
+    }
+    .mini{
+      border:none;
+      border-radius:10px;
+      padding:7px 9px;
+      cursor:pointer;
+      font-size:11px;
+      background:rgba(255,255,255,.06);
+      color:#e9eeff;
+      border:1px solid rgba(255,255,255,.06);
+    }
+    .mini:hover{background:rgba(255,255,255,.09)}
     .tiny{
       color:var(--muted);
       font-size:12px;
@@ -646,6 +863,8 @@ def page_html() -> str:
       }
       .main{min-height:74vh}
       .tools{display:flex}
+      .search{width:100%}
+      .topbar-tools{justify-content:flex-start}
     }
   </style>
 </head>
@@ -658,7 +877,7 @@ def page_html() -> str:
         <div class="brand">
           <div>
             <h1>LinkUp</h1>
-            <small>clean, fast, and a little meaner than Discord</small>
+            <small>clean, fast, and less cramped</small>
           </div>
           <div class="badge">LIVE</div>
         </div>
@@ -690,12 +909,20 @@ def page_html() -> str:
               <span>online now</span>
             </div>
             <div class="stat">
+              <b id="statPins">0</b>
+              <span>pinned messages</span>
+            </div>
+            <div class="stat">
               <b id="statState">idle</b>
               <span>connection state</span>
             </div>
           </div>
         </div>
-        <div class="conn"><span class="dot"></span><span id="connState">connecting...</span></div>
+        <div class="topbar-tools">
+          <input class="search" id="searchInput" placeholder="Search messages in this room..." />
+          <button class="toolbtn" id="jumpPinsBtn">Pins</button>
+          <div class="conn"><span class="dot"></span><span id="connState">connecting...</span></div>
+        </div>
       </div>
 
       <div class="typing" id="typingLine"></div>
@@ -712,27 +939,32 @@ def page_html() -> str:
     <aside class="tools glass">
       <div class="panel">
         <h3>Your profile</h3>
-        <p>Set your display name. This is your live nickname in the current room.</p>
+        <p>Set your display name. Your browser keeps it saved.</p>
         <input class="input" id="nameInput" maxlength="24" placeholder="Your name" />
       </div>
 
       <div class="panel">
-        <h3>Who is online</h3>
+        <h3>Online now</h3>
         <ul class="list" id="members"></ul>
+      </div>
+
+      <div class="panel">
+        <h3>Pinned messages</h3>
+        <ul class="list" id="pins"></ul>
       </div>
 
       <div class="panel">
         <h3>What’s new</h3>
         <div class="updates">
-          <div class="update"><b>Real presence</b><span>Connected users are pulled from the socket, not faked.</span></div>
-          <div class="update"><b>Bigger chat view</b><span>Main chat area is wider and easier to read.</span></div>
-          <div class="update"><b>Better reconnect</b><span>Stale socket events no longer trap the UI on connecting.</span></div>
-          <div class="update"><b>Room history</b><span>Each room keeps message history while you stay on the server.</span></div>
+          <div class="update"><b>No admin gimmicks</b><span>Nothing is auto-promoted, no first-user power abuse.</span></div>
+          <div class="update"><b>Better UX</b><span>More space, bigger message flow, less visual clutter.</span></div>
+          <div class="update"><b>Search + pins</b><span>Find messages fast and keep important ones up top.</span></div>
+          <div class="update"><b>Replies + reactions</b><span>Talk like a real modern chat app.</span></div>
         </div>
       </div>
 
       <div class="tiny">
-        This starter shows online browser sessions in the current room. Real accounts, DMs, roles, and true global presence need auth + database next.
+        This is now built like a product shell, not a tiny demo. Add auth + database next and it becomes persistent.
       </div>
     </aside>
   </div>
@@ -784,13 +1016,19 @@ def page_html() -> str:
     typingLine: document.getElementById("typingLine"),
     statMessages: document.getElementById("statMessages"),
     statUsers: document.getElementById("statUsers"),
+    statPins: document.getElementById("statPins"),
     statState: document.getElementById("statState"),
+    searchInput: document.getElementById("searchInput"),
+    pins: document.getElementById("pins"),
+    jumpPinsBtn: document.getElementById("jumpPinsBtn"),
   };
 
   const savedName = localStorage.getItem("linkup_name") || "You";
+  const localClientId = localStorage.getItem("linkup_client_id") || ("cli_" + Math.random().toString(36).slice(2, 10));
+  localStorage.setItem("linkup_client_id", localClientId);
   els.nameInput.value = savedName;
-  let displayName = savedName;
 
+  let displayName = savedName;
   let selectedServer = localStorage.getItem("linkup_server") || "home";
   let selectedChannel = localStorage.getItem("linkup_channel") || "general";
 
@@ -799,18 +1037,20 @@ def page_html() -> str:
   let reconnectTimer = null;
   let handshakeTimer = null;
   let retryCount = 0;
+  let typingTimeout = null;
+  let activeReplyTo = null;
 
-  const localClientId = "cli_" + Math.random().toString(36).slice(2, 10);
   const roomMessages = new Map();
   const roomSeen = new Map();
-  let currentPresence = [];
-  let typingTimeout = null;
+  const roomPresence = new Map();
+  const roomPins = new Map();
+  const pinnedIds = new Set();
 
   const systemSeeds = {
     general: [
       "Welcome to LinkUp. This room is live.",
-      "The online list is now real for the current room.",
-      "You can switch channels, rename yourself, and watch presence update instantly."
+      "Search, pin, reply, and react are enabled.",
+      "No fake admin junk. Just chat features."
     ],
     announcements: ["Ship updates here.", "Use this room for changelogs."],
     showcase: ["Drop your best work here.", "Show your builds and screenshots."],
@@ -825,6 +1065,8 @@ def page_html() -> str:
     focus: ["Deep work zone."]
   };
 
+  const emojiChoices = ["👍", "🔥", "😂", "👀", "💯", "❤️"];
+
   function escapeHtml(str) {
     return String(str).replace(/[&<>"']/g, s => ({
       "&":"&amp;",
@@ -836,10 +1078,7 @@ def page_html() -> str:
   }
 
   function fmtTime(ts) {
-    return new Date(ts || Date.now()).toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit"
-    });
+    return new Date(ts || Date.now()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   }
 
   function currentChannel() {
@@ -870,12 +1109,9 @@ def page_html() -> str:
       }));
       roomMessages.set(room, seed);
       roomSeen.set(room, new Set(seed.map(m => m.msg_id)));
+      roomPresence.set(room, []);
+      roomPins.set(room, []);
     }
-  }
-
-  function getRoomMessages(room) {
-    ensureRoom(room);
-    return roomMessages.get(room);
   }
 
   function seenSet(room) {
@@ -883,10 +1119,40 @@ def page_html() -> str:
     return roomSeen.get(room);
   }
 
+  function getRoomMessages(room) {
+    ensureRoom(room);
+    return roomMessages.get(room);
+  }
+
+  function getPresence(room) {
+    ensureRoom(room);
+    return roomPresence.get(room) || [];
+  }
+
+  function getPins(room) {
+    ensureRoom(room);
+    return roomPins.get(room) || [];
+  }
+
+  function myState(room) {
+    const users = getPresence(room);
+    return users.find(u => u.client_id === localClientId) || null;
+  }
+
+  function canPin() {
+    return true;
+  }
+
+  function renderReactionBadges(reactions = {}) {
+    const keys = Object.keys(reactions || {});
+    if (!keys.length) return "";
+    return keys.map(e => `<button class="chipbtn" data-emoji="${escapeHtml(e)}">${escapeHtml(e)} ${reactions[e]}</button>`).join("");
+  }
+
   function renderMessageHtml(m) {
     if (m.kind === "system") {
       return `
-        <div class="msg system">
+        <div class="msg system" data-id="${escapeHtml(m.msg_id)}">
           <div class="avatar">!</div>
           <div>
             <div class="head">
@@ -900,9 +1166,11 @@ def page_html() -> str:
 
     const initial = (m.name || "?").trim().slice(0, 1).toUpperCase();
     const isSelf = m.client_id === localClientId;
+    const reactions = m.reactions || {};
+    const reply = m.reply_preview;
 
     return `
-      <div class="msg">
+      <div class="msg" data-id="${escapeHtml(m.msg_id)}">
         <div class="avatar">${escapeHtml(initial)}</div>
         <div>
           <div class="head">
@@ -912,16 +1180,65 @@ def page_html() -> str:
             </div>
             <span class="time">${fmtTime(m.time)}</span>
           </div>
+          ${reply ? `
+            <div class="replybox">
+              Replying to <b>${escapeHtml(reply.name || "Guest")}</b><br/>
+              ${escapeHtml((reply.text || "").slice(0, 120))}
+            </div>
+          ` : ""}
           <div class="text">${escapeHtml(m.text || "")}</div>
+          <div class="msg-actions">
+            <button class="chipbtn" data-act="reply" data-id="${escapeHtml(m.msg_id)}">Reply</button>
+            <button class="chipbtn" data-act="pin" data-id="${escapeHtml(m.msg_id)}">${pinnedIds.has(m.msg_id) ? "Unpin" : "Pin"}</button>
+            <button class="chipbtn" data-act="react" data-id="${escapeHtml(m.msg_id)}">React</button>
+            ${Object.keys(reactions).length ? renderReactionBadges(reactions) : ""}
+          </div>
         </div>
       </div>`;
   }
 
   function renderMessages(room) {
-    const msgs = getRoomMessages(room);
+    const query = (els.searchInput.value || "").trim().toLowerCase();
+    const msgs = getRoomMessages(room).filter(m => {
+      if (m.kind === "system") return true;
+      if (!query) return true;
+      return String(m.text || "").toLowerCase().includes(query) || String(m.name || "").toLowerCase().includes(query);
+    });
+
     els.messages.innerHTML = msgs.map(renderMessageHtml).join("");
-    els.statMessages.textContent = String(msgs.filter(m => m.kind !== "system").length);
+    els.statMessages.textContent = String(getRoomMessages(room).filter(m => m.kind !== "system").length);
     els.messages.scrollTop = els.messages.scrollHeight;
+
+    bindMessageActions();
+  }
+
+  function updatePins(room) {
+    const pins = getPins(room);
+    els.pins.innerHTML = pins.length
+      ? pins.slice().reverse().map(p => `
+          <li class="user">
+            <div class="user-main">
+              <strong>${escapeHtml(p.name || "Guest")}</strong>
+              <span>${escapeHtml((p.text || "").slice(0, 70))}</span>
+            </div>
+            <button class="mini" data-jump="${escapeHtml(p.msg_id)}">Jump</button>
+          </li>
+        `).join("")
+      : `<li class="user"><div class="user-main"><strong>No pins yet</strong><span>Pin important messages so they stay visible.</span></div></li>`;
+
+    els.statPins.textContent = String(pins.length);
+
+    els.pins.querySelectorAll("button[data-jump]").forEach(btn => {
+      btn.onclick = () => {
+        const id = btn.dataset.jump;
+        const node = els.messages.querySelector(`[data-id="${CSS.escape(id)}"]`);
+        if (node) {
+          node.scrollIntoView({ behavior: "smooth", block: "center" });
+          node.style.outline = "1px solid rgba(123,140,255,.42)";
+          setTimeout(() => { node.style.outline = ""; }, 1200);
+        }
+      };
+    });
   }
 
   function addMessage(room, msg, renderNow = true) {
@@ -935,6 +1252,7 @@ def page_html() -> str:
     if (seen.has(msg.msg_id)) return;
     seen.add(msg.msg_id);
 
+    msg.reactions = msg.reactions || {};
     const list = roomMessages.get(room);
     list.push(msg);
 
@@ -942,6 +1260,7 @@ def page_html() -> str:
       els.messages.insertAdjacentHTML("beforeend", renderMessageHtml(msg));
       els.messages.scrollTop = els.messages.scrollHeight;
       els.statMessages.textContent = String(list.filter(m => m.kind !== "system").length);
+      bindMessageActions();
     }
   }
 
@@ -958,6 +1277,7 @@ def page_html() -> str:
         if (nextServer === selectedServer) return;
         selectedServer = nextServer;
         selectedChannel = channelsByServer[selectedServer][0].id;
+        activeReplyTo = null;
         localStorage.setItem("linkup_server", selectedServer);
         localStorage.setItem("linkup_channel", selectedChannel);
         renderAll();
@@ -982,6 +1302,7 @@ def page_html() -> str:
         const nextChannel = btn.dataset.channel;
         if (nextChannel === selectedChannel) return;
         selectedChannel = nextChannel;
+        activeReplyTo = null;
         localStorage.setItem("linkup_channel", selectedChannel);
         renderAll();
         connectSocket(true);
@@ -989,21 +1310,37 @@ def page_html() -> str:
     });
   }
 
-  function renderMembers() {
-    const roomUsers = currentPresence || [];
-    els.members.innerHTML = roomUsers.length
-      ? roomUsers.map(u => `
-          <li class="user">
-            <div>
-              <strong>${escapeHtml(u.name)}</strong><br />
-              <span>${u.client_id === localClientId ? "you • live now" : "connected"}</span>
-            </div>
-            <span class="badge">online</span>
-          </li>
-        `).join("")
-      : `<li class="user"><div><strong>No one else yet</strong><br /><span>Be the first in this room.</span></div><span class="badge">0</span></li>`;
+  function updateProfileBox() {
+    const me = myState(roomId());
+    const label = me ? `online • ${me.name}` : "offline in room";
+    document.getElementById("roomLabel").textContent = `#${selectedChannel}`;
+    els.statUsers.textContent = String(getPresence(roomId()).length);
+    document.getElementById("channelTitle").textContent = currentChannel()?.title || "# general";
+    document.getElementById("channelDescription").textContent = currentChannel()?.description || "A large room for real-time chat.";
+  }
 
-    els.statUsers.textContent = String(roomUsers.length);
+  function renderMembers() {
+    const roomUsers = getPresence(roomId());
+    const me = myState(roomId());
+
+    document.getElementById("meName").textContent = displayName;
+    document.getElementById("meRoleLine").textContent = me ? "online now" : "connecting...";
+    document.getElementById("meRoleBadge").textContent = me ? "live" : "guest";
+
+    els.members.innerHTML = roomUsers.length
+      ? roomUsers.map(u => {
+          const isSelf = u.client_id === localClientId;
+          return `
+            <li class="user">
+              <div class="user-main">
+                <strong>${escapeHtml(u.name)} ${isSelf ? "• you" : ""}</strong>
+                <span>connected</span>
+              </div>
+              <span class="badge">online</span>
+            </li>
+          `;
+        }).join("")
+      : `<li class="user"><div class="user-main"><strong>No one else yet</strong><span>Be the first in this room.</span></div><span class="badge">0</span></li>`;
   }
 
   function setHeader() {
@@ -1018,7 +1355,9 @@ def page_html() -> str:
     renderServers();
     renderChannels();
     setHeader();
+    updateProfileBox();
     renderMembers();
+    updatePins(roomId());
     renderMessages(roomId());
   }
 
@@ -1066,7 +1405,7 @@ def page_html() -> str:
       try { socket.close(1000, "switching-room"); } catch {}
     }
 
-    currentPresence = [];
+    roomPresence.set(room, []);
     els.typingLine.textContent = "";
     setStatus("connecting...");
 
@@ -1117,24 +1456,32 @@ def page_html() -> str:
 
       if (data.kind === "history") {
         const history = Array.isArray(data.messages) ? data.messages : [];
+        const users = Array.isArray(data.users) ? data.users : [];
+        const pins = Array.isArray(data.pins) ? data.pins : [];
+
         const seen = new Set();
         roomMessages.set(room, []);
         roomSeen.set(room, seen);
+        roomPresence.set(room, users);
+        roomPins.set(room, pins);
+        pinnedIds.clear();
+        pins.forEach(p => pinnedIds.add(p.msg_id));
 
         history.forEach(m => {
           if (!m.msg_id) m.msg_id = "hist_" + Math.random().toString(36).slice(2, 12);
           seen.add(m.msg_id);
+          if (!m.reactions) m.reactions = {};
           roomMessages.get(room).push(m);
         });
 
-        currentPresence = Array.isArray(data.users) ? data.users : [];
-        renderMessages(room);
         renderMembers();
+        updatePins(room);
+        renderMessages(room);
         return;
       }
 
       if (data.kind === "presence") {
-        currentPresence = Array.isArray(data.users) ? data.users : [];
+        roomPresence.set(room, Array.isArray(data.users) ? data.users : []);
         renderMembers();
         return;
       }
@@ -1150,10 +1497,38 @@ def page_html() -> str:
         return;
       }
 
+      if (data.kind === "system") {
+        addMessage(room, data, true);
+        return;
+      }
+
+      if (data.kind === "pin_update") {
+        const msgId = data.message?.msg_id;
+        if (data.action === "pinned" && msgId) pinnedIds.add(msgId);
+        if (data.action === "unpinned" && msgId) pinnedIds.delete(msgId);
+
+        const pins = Array.isArray(data.pins) ? data.pins : [];
+        roomPins.set(room, pins);
+        updatePins(room);
+        renderMessages(room);
+        return;
+      }
+
+      if (data.kind === "reaction_update") {
+        const list = roomMessages.get(room) || [];
+        const target = list.find(m => m.msg_id === data.msg_id);
+        if (target) {
+          target.reactions = data.reactions || {};
+          renderMessages(room);
+        }
+        return;
+      }
+
       if (data.kind === "message") {
         data.time = data.time || Date.now();
         data.client_id = data.client_id || "remote";
         data.msg_id = data.msg_id || `srv_${room}_${data.time}_${Math.random().toString(36).slice(2, 8)}`;
+        if (!data.reactions) data.reactions = {};
         addMessage(room, data, true);
       }
     };
@@ -1201,8 +1576,18 @@ def page_html() -> str:
       room: roomId(),
       server: selectedServer,
       channel: selectedChannel,
+      reply_to: activeReplyTo,
       time: Date.now()
     };
+
+    const replyNode = activeReplyTo ? roomMessages.get(roomId())?.find(m => m.msg_id === activeReplyTo) : null;
+    if (replyNode) {
+      payload.reply_preview = {
+        msg_id: replyNode.msg_id,
+        name: replyNode.name,
+        text: replyNode.text
+      };
+    }
 
     addMessage(roomId(), payload, true);
 
@@ -1210,9 +1595,62 @@ def page_html() -> str:
       socket.send(JSON.stringify(payload));
     }
 
+    activeReplyTo = null;
     els.messageInput.value = "";
-    els.messageInput.style.height = "58px";
+    els.messageInput.style.height = "72px";
     els.messageInput.focus();
+  }
+
+  function bindMessageActions() {
+    document.querySelectorAll(".msg-actions .chipbtn").forEach(btn => {
+      btn.onclick = () => {
+        const room = roomId();
+        const act = btn.dataset.act;
+        const msgId = btn.dataset.id;
+
+        if (act === "reply") {
+          activeReplyTo = msgId;
+          const node = roomMessages.get(room)?.find(m => m.msg_id === msgId);
+          if (node) {
+            els.messageInput.placeholder = `Replying to ${node.name}...`;
+            els.messageInput.focus();
+          }
+          return;
+        }
+
+        if (act === "pin") {
+          if (!canPin()) return;
+          if (socket && socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({
+              kind: "pin",
+              client_id: localClientId,
+              name: displayName,
+              room,
+              msg_id: msgId,
+              time: Date.now()
+            }));
+          }
+          return;
+        }
+
+        if (act === "react") {
+          const emoji = prompt(`Pick a reaction: ${emojiChoices.join(" ")}`, "👍");
+          if (!emoji) return;
+          if (socket && socket.readyState === WebSocket.OPEN) {
+            socket.send(JSON.stringify({
+              kind: "reaction",
+              client_id: localClientId,
+              name: displayName,
+              room,
+              msg_id: msgId,
+              emoji: emoji.trim().slice(0, 4),
+              time: Date.now()
+            }));
+          }
+          return;
+        }
+      };
+    });
   }
 
   els.nameInput.addEventListener("change", () => {
@@ -1228,6 +1666,8 @@ def page_html() -> str:
         time: Date.now()
       }));
     }
+
+    updateProfileBox();
   });
 
   els.sendBtn.onclick = sendMessage;
@@ -1241,8 +1681,17 @@ def page_html() -> str:
 
   els.messageInput.addEventListener("input", () => {
     els.messageInput.style.height = "auto";
-    els.messageInput.style.height = Math.min(180, els.messageInput.scrollHeight) + "px";
+    els.messageInput.style.height = Math.min(220, els.messageInput.scrollHeight) + "px";
     sendTyping();
+  });
+
+  els.searchInput.addEventListener("input", () => {
+    renderMessages(roomId());
+  });
+
+  els.jumpPinsBtn.addEventListener("click", () => {
+    const firstPin = els.pins.querySelector("button[data-jump]");
+    if (firstPin) firstPin.click();
   });
 
   window.addEventListener("online", () => {
