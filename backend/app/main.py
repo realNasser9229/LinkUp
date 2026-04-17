@@ -1111,8 +1111,8 @@ def page_html() -> str:
       </div>
       <div class="comp-wrap">
         <div class="comp-left">
-          <button class="comp-btn" title="Attach file" onclick="showToast('File uploads coming soon!', '')">📎</button>
-          <button class="comp-btn" title="GIF" onclick="showToast('GIFs coming soon!', '')">🎞</button>
+          <button class="comp-btn" title="Attach file" onclick="showToast('File uploads coming soon!', '')">+</button>
+          <button class="comp-btn" title="GIF" onclick="showToast('GIFs coming soon!', '')">🖼️</button>
         </div>
         <textarea class="msg-input" id="msgInput" placeholder="Message #general…" rows="1"></textarea>
         <div class="comp-right">
