@@ -1,4 +1,4 @@
-from __future__ import annotations
+ffrom __future__ import annotations
 
 import json
 import os
@@ -11,17 +11,15 @@ from fastapi import APIRouter, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-app = FastAPI(title="LinkUp")
+# --- Backend Configuration & Models ---
 
+app = FastAPI(title="LinkUp - Nasoro Edition")
 
 class Settings:
     def __init__(self) -> None:
+        # Configuration for cross-origin requests
         origins = os.getenv("CORS_ORIGINS", "*").strip()
-        if origins == "*":
-            self.cors_origins = ["*"]
-        else:
-            self.cors_origins = [o.strip() for o in origins.split(",") if o.strip()]
-
+        self.cors_origins = [o.strip() for o in origins.split(",") if o.strip()] if origins != "*" else ["*"]
 
 settings = Settings()
 
@@ -33,10 +31,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ws_router = APIRouter()
-
-
 class RoomState:
+    """Manages the state of chat rooms, including members, history, pins, and reactions."""
     def __init__(self) -> None:
         self.sockets: Dict[str, Dict[str, WebSocket]] = {}
         self.members: Dict[str, Dict[str, dict]] = {}
@@ -56,23 +52,18 @@ class RoomState:
         for client_id, info in self.members[room].items():
             if client_id not in self.sockets[room]:
                 continue
-            users.append(
-                {
-                    "client_id": client_id,
-                    "name": info["name"],
-                    "joined_at": info["joined_at"],
-                }
-            )
+            users.append({
+                "client_id": client_id,
+                "name": info["name"],
+                "joined_at": info["joined_at"],
+            })
         users.sort(key=lambda u: (u["joined_at"], u["name"].lower()))
         return users
 
     def register(self, room: str, client_id: str, name: str, ws: WebSocket) -> bool:
         self.ensure(room)
         is_new = client_id not in self.members[room]
-        if is_new:
-            self.members[room][client_id] = {"name": name, "joined_at": int(time.time() * 1000)}
-        else:
-            self.members[room][client_id]["name"] = name
+        self.members[room][client_id] = {"name": name, "joined_at": int(time.time() * 1000)}
         self.sockets[room][client_id] = ws
         return is_new
 
@@ -84,9 +75,8 @@ class RoomState:
     def append_history(self, room: str, payload: dict) -> None:
         self.ensure(room)
         self.history[room].append(payload)
-        # Keep history slightly shorter if we are allowing base64 attachments to save RAM
-        if len(self.history[room]) > 200:
-            self.history[room] = self.history[room][-200:]
+        if len(self.history[room]) > 500: # Increased history buffer
+            self.history[room] = self.history[room][-500:]
 
     def get_message_by_id(self, room: str, msg_id: str) -> Optional[dict]:
         self.ensure(room)
@@ -102,14 +92,11 @@ class RoomState:
     def toggle_pin(self, room: str, msg_id: str) -> Optional[dict]:
         self.ensure(room)
         msg = self.get_message_by_id(room, msg_id)
-        if not msg:
-            return None
-
+        if not msg: return None
         existing = next((p for p in self.pins[room] if p.get("msg_id") == msg_id), None)
         if existing:
             self.pins[room] = [p for p in self.pins[room] if p.get("msg_id") != msg_id]
             return {"action": "unpinned", "message": msg}
-
         pin_payload = {
             "msg_id": msg["msg_id"],
             "name": msg.get("name", "Guest"),
@@ -122,47 +109,11 @@ class RoomState:
 
     def toggle_reaction(self, room: str, msg_id: str, emoji: str, client_id: str) -> Optional[dict]:
         self.ensure(room)
-        msg = self.get_message_by_id(room, msg_id)
-        if not msg:
-            return None
-
         bucket = self.reactions[room][msg_id][emoji]
-        if client_id in bucket:
-            bucket.remove(client_id)
-        else:
-            bucket.add(client_id)
-
+        if client_id in bucket: bucket.remove(client_id)
+        else: bucket.add(client_id)
         counts = {e: len(users) for e, users in self.reactions[room][msg_id].items()}
         return {"msg_id": msg_id, "reactions": counts}
-
-    def set_message_reactions(self, room: str, msg_id: str, reactions: dict) -> None:
-        msg = self.get_message_by_id(room, msg_id)
-        if msg:
-            msg["reactions"] = reactions
-
-    async def send_history(self, room: str, ws: WebSocket) -> None:
-        self.ensure(room)
-        await ws.send_json(
-            {
-                "kind": "history",
-                "room": room,
-                "messages": self.history[room][-100:],
-                "users": self.current_users(room),
-                "pins": self.build_pins(room),
-                "time": int(time.time() * 1000),
-            }
-        )
-
-    async def send_presence(self, room: str) -> None:
-        await self.broadcast(
-            room,
-            {
-                "kind": "presence",
-                "room": room,
-                "users": self.current_users(room),
-                "time": int(time.time() * 1000),
-            },
-        )
 
     async def broadcast(self, room: str, payload: dict) -> None:
         self.ensure(room)
@@ -172,1797 +123,374 @@ class RoomState:
                 await ws.send_json(payload)
             except Exception:
                 dead.append(client_id)
-
         for client_id in dead:
             self.remove(room, client_id)
 
-    async def system(self, room: str, text: str) -> None:
-        await self.broadcast(
-            room,
-            {
-                "kind": "system",
-                "msg_id": "sys_" + uuid4().hex,
-                "name": "System",
-                "text": text,
-                "room": room,
-                "time": int(time.time() * 1000),
-            },
-        )
-
-
 rooms = RoomState()
 
+# --- WebSocket Routing ---
+
+ws_router = APIRouter()
 
 @ws_router.websocket("/{room_id}")
 async def room_socket(websocket: WebSocket, room_id: str):
     await websocket.accept()
-    rooms.ensure(room_id)
-
     client_id = "guest_" + uuid4().hex[:10]
     display_name = "Guest"
 
     try:
         while True:
             raw = await websocket.receive_text()
-            try:
-                data = json.loads(raw)
-                if not isinstance(data, dict):
-                    data = {}
-            except Exception:
-                data = {}
-
-            kind = str(data.get("kind") or "message")
-            incoming_client_id = str(data.get("client_id") or client_id)
-            incoming_name = str(data.get("name") or display_name).strip()[:24] or "Guest"
+            data = json.loads(raw) if raw else {}
+            kind = data.get("kind", "message")
+            
+            # Update user identity if provided
+            if "name" in data: display_name = str(data["name"])[:24].strip() or "Guest"
+            if "client_id" in data: client_id = str(data["client_id"])
 
             if kind == "hello":
-                client_id = incoming_client_id
-                display_name = incoming_name
-
-                is_new = rooms.register(room_id, client_id, display_name, websocket)
-                if is_new:
-                    await rooms.system(room_id, f"**{display_name}** slid into the server.")
-                await rooms.send_history(room_id, websocket)
-                await rooms.send_presence(room_id)
+                rooms.register(room_id, client_id, display_name, websocket)
+                await rooms.broadcast(room_id, {"kind": "presence", "users": rooms.current_users(room_id)})
+                await websocket.send_json({
+                    "kind": "history", 
+                    "messages": rooms.history.get(room_id, [])[-150:],
+                    "pins": rooms.build_pins(room_id)
+                })
                 continue
 
             if kind == "rename":
-                old_name = display_name
-                client_id = incoming_client_id
-                display_name = incoming_name
                 rooms.register(room_id, client_id, display_name, websocket)
-                await rooms.system(room_id, f"**{old_name}** is now known as **{display_name}**.")
-                await rooms.send_presence(room_id)
+                await rooms.broadcast(room_id, {"kind": "presence", "users": rooms.current_users(room_id)})
                 continue
 
-            if client_id not in rooms.members[room_id]:
-                client_id = incoming_client_id
-                display_name = incoming_name
-                rooms.register(room_id, client_id, display_name, websocket)
-
-            if kind == "typing":
-                await rooms.broadcast(
-                    room_id,
-                    {
-                        "kind": "typing",
-                        "room": room_id,
-                        "client_id": client_id,
-                        "name": display_name,
-                        "time": int(time.time() * 1000),
-                    },
-                )
-                continue
-
-            if kind == "pin":
-                msg_id = str(data.get("msg_id") or "")
-                result = rooms.toggle_pin(room_id, msg_id)
-                if not result:
-                    continue
-                await rooms.broadcast(
-                    room_id,
-                    {
-                        "kind": "pin_update",
-                        "action": result["action"],
-                        "message": result["message"],
-                        "pins": rooms.build_pins(room_id),
-                        "room": room_id,
-                        "time": int(time.time() * 1000),
-                    },
-                )
-                if result["action"] == "pinned":
-                    await rooms.system(room_id, f"**{display_name}** pinned a message.")
-                continue
-
-            if kind == "reaction":
-                msg_id = str(data.get("msg_id") or "")
-                emoji = str(data.get("emoji") or "👍").strip()[:4]
-                result = rooms.toggle_reaction(room_id, msg_id, emoji, client_id)
-                if not result:
-                    continue
-                rooms.set_message_reactions(room_id, msg_id, result["reactions"])
-                await rooms.broadcast(
-                    room_id,
-                    {
-                        "kind": "reaction_update",
-                        "msg_id": result["msg_id"],
-                        "reactions": result["reactions"],
-                        "room": room_id,
-                        "time": int(time.time() * 1000),
-                    },
-                )
-                continue
-
-            if kind == "edit":
-                msg_id = str(data.get("msg_id") or "")
-                new_text = str(data.get("text") or "").strip()
-                msg = rooms.get_message_by_id(room_id, msg_id)
-                if msg and msg.get("client_id") == client_id:
-                    msg["text"] = new_text
-                    msg["edited"] = True
-                    await rooms.broadcast(room_id, {
-                        "kind": "edit_update",
-                        "msg_id": msg_id,
-                        "text": new_text,
-                        "room": room_id
-                    })
-                continue
-
-            if kind == "delete":
-                msg_id = str(data.get("msg_id") or "")
-                msg = rooms.get_message_by_id(room_id, msg_id)
-                if msg and msg.get("client_id") == client_id:
-                    rooms.history[room_id] = [m for m in rooms.history[room_id] if m.get("msg_id") != msg_id]
-                    await rooms.broadcast(room_id, {
-                        "kind": "delete_update",
-                        "msg_id": msg_id,
-                        "room": room_id
-                    })
-                continue
-
-            text = str(data.get("text") or "").strip()
-            attachment = data.get("attachment")
-            
-            if not text and not attachment:
-                continue
-
-            reply_to = data.get("reply_to")
-            reply_preview = None
-            if reply_to:
-                reply_msg = rooms.get_message_by_id(room_id, str(reply_to))
-                if reply_msg:
-                    reply_preview = {
-                        "msg_id": reply_msg.get("msg_id"),
-                        "name": reply_msg.get("name", "Guest"),
-                        "text": reply_msg.get("text", ""),
-                    }
-
-            message = {
-                "kind": "message",
-                "msg_id": str(data.get("msg_id") or ("msg_" + uuid4().hex)),
-                "client_id": client_id,
-                "name": display_name,
-                "text": text,
-                "room": room_id,
-                "time": int(data.get("time") or int(time.time() * 1000)),
-                "reply_to": reply_to,
-                "reply_preview": reply_preview,
-                "reactions": {},
-                "attachment": attachment
-            }
-
-            rooms.append_history(room_id, message)
-            await rooms.broadcast(room_id, message)
+            if kind == "message":
+                text = str(data.get("text", "")).strip()
+                if not text: continue
+                msg_payload = {
+                    "kind": "message",
+                    "msg_id": "msg_" + uuid4().hex,
+                    "client_id": client_id,
+                    "name": display_name,
+                    "text": text,
+                    "time": int(time.time() * 1000),
+                    "reactions": {}
+                }
+                rooms.append_history(room_id, msg_payload)
+                await rooms.broadcast(room_id, msg_payload)
 
     except WebSocketDisconnect:
         rooms.remove(room_id, client_id)
-        await rooms.send_presence(room_id)
+        await rooms.broadcast(room_id, {"kind": "presence", "users": rooms.current_users(room_id)})
     except Exception:
         rooms.remove(room_id, client_id)
-        await rooms.send_presence(room_id)
 
+app.include_router(ws_router, prefix="/ws")
 
-app.include_router(ws_router, prefix="/ws", tags=["websocket"])
-
+# --- Frontend HTML/CSS/JS ---
 
 def page_html() -> str:
-    return r"""<!doctype html>
+    return r"""<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1, user-scalable=0" />
-  <meta name="theme-color" content="#313338" />
-  <title>LinkUp</title>
-  <style>
-    :root{
-      --bg:#313338;
-      --panel:#2b2d31;
-      --panel-2:#1e1f22;
-      --panel-3:#383a40;
-      --line:rgba(255,255,255,.06);
-      --text:#f2f3f5;
-      --muted:#b5bac1;
-      --accent:#5865f2;
-      --accent-hover:#4752c4;
-      --accent-2:#23a559;
-      --danger:#da373c;
-      --shadow:0 8px 16px rgba(0,0,0,.24);
-      --radius:8px;
-      color-scheme: dark;
-    }
-    
-    ::-webkit-scrollbar { width: 8px; height: 8px; }
-    ::-webkit-scrollbar-track { background: var(--panel); }
-    ::-webkit-scrollbar-thumb { background: #1a1b1e; border-radius: 4px; }
-    ::-webkit-scrollbar-thumb:hover { background: #111214; }
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Nasoro LinkUp</title>
+    <style>
+        :root {
+            /* Material 3 & Glassmorphism Tokens */
+            --bg: #0f1115;
+            --surface: rgba(28, 27, 31, 0.7);
+            --glass: rgba(255, 255, 255, 0.08);
+            --glass-border: rgba(255, 255, 255, 0.12);
+            --primary: #d0bcff;
+            --on-primary: #381e72;
+            --secondary: #ccc2dc;
+            --text: #e6e1e5;
+            --text-muted: #938f99;
+            --blur: 24px;
+            --radius-m3: 28px;
+        }
 
-    *{box-sizing:border-box}
-    html,body{height:100%; margin:0; padding:0;}
-    body{
-      padding-top: env(safe-area-inset-top);
-      padding-bottom: env(safe-area-inset-bottom);
-      padding-left: env(safe-area-inset-left);
-      padding-right: env(safe-area-inset-right);
-      font-family: 'gg sans', 'Noto Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
-      background:var(--bg);
-      color:var(--text);
-      overflow:hidden;
-      display: flex;
-      flex-direction: column;
-    }
-    button,input,textarea{font:inherit}
+        * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+        
+        body {
+            margin: 0;
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Roboto', 'Inter', system-ui, sans-serif;
+            height: 100vh;
+            overflow: hidden;
+            display: flex;
+        }
 
-    .app{
-      height:100%;
-      display:grid;
-      grid-template-columns: 72px 240px minmax(0,1fr) 268px;
-      min-width:0;
-      flex: 1;
-    }
+        /* Responsive Layout */
+        .app-shell {
+            display: flex;
+            width: 100%;
+            height: 100%;
+            background: radial-gradient(circle at top right, #2d2346, #0f1115);
+        }
 
-    .servers{
-      background:var(--panel-2);
-      padding:12px 0;
-      display:flex;
-      flex-direction:column;
-      gap:8px;
-      align-items:center;
-      overflow-y:auto;
-    }
-    .server-btn{
-      width:48px;
-      height:48px;
-      border:none;
-      border-radius:24px;
-      cursor:pointer;
-      background:var(--bg);
-      color:var(--text);
-      font-weight:700;
-      font-size: 16px;
-      transition: all .2s ease;
-      box-shadow:none;
-      flex:0 0 auto;
-      position: relative;
-    }
-    .server-btn:hover{
-      background:var(--accent);
-      border-radius:16px;
-      color: #fff;
-    }
-    .server-btn.active{
-      background:var(--accent);
-      border-radius:16px;
-      color: #fff;
-    }
-    .server-btn::before {
-      content: "";
-      position: absolute;
-      left: -12px;
-      top: 50%;
-      transform: translateY(-50%) scale(0);
-      width: 8px;
-      height: 8px;
-      background: #fff;
-      border-radius: 4px;
-      transition: all .2s ease;
-    }
-    .server-btn.active::before {
-      height: 40px;
-      transform: translateY(-50%) scale(1);
-    }
+        /* Sidebar / Channel Drawer */
+        .sidebar {
+            width: 280px;
+            height: 100%;
+            background: var(--glass);
+            backdrop-filter: blur(var(--blur));
+            -webkit-backdrop-filter: blur(var(--blur));
+            border-right: 1px solid var(--glass-border);
+            display: flex;
+            flex-direction: column;
+            transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            z-index: 1000;
+        }
 
-    .sidebar{
-      background:var(--panel);
-      display:flex;
-      flex-direction:column;
-      min-width:0;
-      overflow:hidden;
-    }
-    .side-top{
-      padding:16px;
-      border-bottom:1px solid #1e1f22;
-      flex:0 0 auto;
-      box-shadow: 0 1px 2px rgba(0,0,0,.2);
-      z-index: 2;
-    }
-    .brand{
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:10px;
-    }
-    .brand h1{
-      margin:0;
-      font-size:16px;
-      font-weight: 800;
-      line-height:1.2;
-    }
-    .section{
-      padding:16px 8px 8px;
-      overflow-y:auto;
-      min-height:0;
-      flex:1 1 auto;
-    }
-    .section-title{
-      margin:0 8px 4px;
-      color:var(--muted);
-      font-size:12px;
-      font-weight:700;
-      text-transform:uppercase;
-      letter-spacing:.02em;
-    }
-    .channel{
-      width:100%;
-      border:none;
-      border-radius:4px;
-      padding:6px 8px;
-      margin-bottom:2px;
-      cursor:pointer;
-      background:transparent;
-      color:#80848e;
-      display:flex;
-      align-items:center;
-      gap:6px;
-      text-align:left;
-      transition: background .15s ease, color .15s ease;
-    }
-    .channel:hover{
-      background:rgba(78,80,88,.6);
-      color: #dbdee1;
-    }
-    .channel.active{
-      background:rgba(78,80,88,.6);
-      color: #fff;
-    }
-    .channel .hash {
-      font-size: 18px;
-      color: #80848e;
-      font-weight: light;
-      margin-right: 2px;
-    }
-    .channel.active .hash { color: #fff; }
-    .channel .meta strong{
-      font-size:15px;
-      font-weight: 500;
-    }
+        .side-header {
+            padding: 24px 16px;
+            border-bottom: 1px solid var(--glass-border);
+        }
 
-    .user-controls {
-      background: #232428;
-      padding: 8px;
-      flex: 0 0 auto;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 8px;
-    }
-    .user-controls .user-info {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      border-radius: 4px;
-      padding: 4px;
-      flex: 1;
-      min-width: 0;
-      cursor: pointer;
-    }
-    .user-controls .user-info:hover {
-      background: rgba(255,255,255,.05);
-    }
-    .user-controls .avatar {
-      width: 32px;
-      height: 32px;
-      border-radius: 50%;
-      background: var(--accent);
-      color: #fff;
-      display: grid;
-      place-items: center;
-      font-weight: 700;
-      font-size: 14px;
-      position: relative;
-    }
-    .user-controls .avatar .status {
-      position: absolute;
-      bottom: 0;
-      right: 0;
-      width: 10px;
-      height: 10px;
-      border-radius: 50%;
-      background: var(--accent-2);
-      border: 2px solid #232428;
-    }
-    .user-controls .user-text {
-      display: flex;
-      flex-direction: column;
-      min-width: 0;
-    }
-    .user-controls .user-text strong {
-      font-size: 14px;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-    .user-controls .user-text span {
-      font-size: 11px;
-      color: var(--muted);
-    }
-    .user-controls button {
-      background: transparent;
-      border: none;
-      color: var(--muted);
-      cursor: pointer;
-      width: 32px;
-      height: 32px;
-      border-radius: 4px;
-      display: grid;
-      place-items: center;
-      transition: .1s;
-    }
-    .user-controls button:hover {
-      background: rgba(255,255,255,.1);
-      color: #fff;
-    }
+        .side-header h1 { margin: 0; font-size: 20px; color: var(--primary); }
 
-    .main{
-      min-width:0;
-      display:flex;
-      flex-direction:column;
-      background:var(--bg);
-      overflow:hidden;
-      position: relative;
-    }
+        .user-config {
+            padding: 16px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
 
-    .main-top{
-      flex:0 0 auto;
-      height:48px;
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      padding:0 16px;
-      border-bottom:1px solid #1e1f22;
-      background:var(--bg);
-      box-shadow: 0 1px 2px rgba(0,0,0,.15);
-      z-index:3;
-    }
-    .titleblock{
-      display:flex;
-      align-items:center;
-      gap:12px;
-      min-width:0;
-    }
-    .titleblock .hash {
-      color: #80848e;
-      font-size: 24px;
-      font-weight: 300;
-    }
-    .titleblock h2{
-      margin:0;
-      font-size:16px;
-      font-weight: 700;
-      white-space:nowrap;
-    }
-    .titleblock .divider {
-      width: 1px;
-      height: 24px;
-      background: #3f4147;
-      margin: 0 4px;
-    }
-    .titleblock p{
-      margin:0;
-      color:var(--muted);
-      font-size:14px;
-      white-space:nowrap;
-      overflow:hidden;
-      text-overflow:ellipsis;
-      max-width:35vw;
-    }
-    .top-actions {
-      display: flex;
-      align-items: center;
-      gap: 16px;
-    }
-    .search-container {
-      position: relative;
-    }
-    .search{
-      width: 144px;
-      padding: 4px 8px;
-      border-radius: 4px;
-      border: none;
-      outline: none;
-      background: #1e1f22;
-      color: var(--text);
-      font-size: 14px;
-      transition: width .2s ease;
-    }
-    .search:focus {
-      width: 240px;
-    }
+        .m3-input {
+            background: rgba(0, 0, 0, 0.3);
+            border: 1px solid var(--glass-border);
+            border-radius: 12px;
+            padding: 12px;
+            color: white;
+            outline: none;
+            width: 100%;
+        }
 
-    .typing{
-      position: absolute;
-      bottom: 85px;
-      left: 16px;
-      font-weight: 600;
-      color: #dbdee1;
-      font-size: 14px;
-      z-index: 10;
-      pointer-events: none;
-      text-shadow: 0 0 4px var(--bg);
-    }
+        .channel-list { flex: 1; overflow-y: auto; padding: 8px; }
 
-    .messages{
-      flex:1 1 auto;
-      min-height:0;
-      overflow-y:auto;
-      padding:16px 0 24px;
-      display: flex;
-      flex-direction: column;
-    }
+        .channel-item {
+            padding: 12px 16px;
+            border-radius: 16px;
+            margin-bottom: 4px;
+            cursor: pointer;
+            transition: 0.2s;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+        .channel-item:hover { background: var(--glass); }
+        .channel-item.active { background: var(--primary); color: var(--on-primary); }
 
-    .msg{
-      display:grid;
-      grid-template-columns: 48px minmax(0,1fr);
-      padding:4px 16px 4px 16px;
-      position:relative;
-      margin-top: 16px;
-    }
-    .msg.compact {
-      margin-top: 0;
-    }
-    .msg:hover{
-      background:rgba(2,2,2,.04);
-    }
-    .msg:hover .msg-actions {
-      opacity: 1;
-    }
-    .avatar-wrapper {
-      width:40px;
-      height:40px;
-      border-radius:50%;
-      background:var(--accent);
-      color:#fff;
-      display:grid;
-      place-items:center;
-      font-weight:700;
-      font-size:16px;
-      cursor: pointer;
-    }
-    .avatar-wrapper:hover {
-      opacity: 0.9;
-    }
-    .compact .avatar-wrapper {
-      display: none;
-    }
-    .compact-time {
-      display: none;
-      font-size: 10px;
-      color: #80848e;
-      text-align: right;
-      padding-right: 4px;
-      line-height: 22px;
-    }
-    .compact:hover .compact-time {
-      display: block;
-    }
+        /* Main Content Area */
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            position: relative;
+        }
 
-    .content{
-      min-width:0;
-    }
-    .header{
-      display:flex;
-      align-items:baseline;
-      gap:8px;
-      min-width:0;
-      flex-wrap:wrap;
-      margin-bottom: 2px;
-    }
-    .compact .header {
-      display: none;
-    }
-    .name{
-      font-weight:500;
-      font-size:16px;
-      color:#fff;
-      cursor: pointer;
-    }
-    .name:hover {
-      text-decoration: underline;
-    }
-    .time{
-      color:#80848e;
-      font-size:12px;
-    }
-    .text{
-      white-space:pre-wrap;
-      word-break:break-word;
-      line-height:1.375rem;
-      font-size:16px;
-      color:#dbdee1;
-    }
-    .text code {
-      font-family: Consolas, monospace;
-      background: #1e1f22;
-      padding: 2px 4px;
-      border-radius: 4px;
-      font-size: 14px;
-    }
-    .text pre {
-      background: #1e1f22;
-      padding: 8px;
-      border-radius: 4px;
-      overflow-x: auto;
-      border: 1px solid #111214;
-    }
-    .text b { font-weight: 700; color: #fff; }
-    .text i { font-style: italic; }
-    .edited-mark { font-size: 11px; color: var(--muted); margin-left: 4px; user-select: none; }
-    
-    .attachment-img {
-      max-width: 400px;
-      max-height: 300px;
-      border-radius: 8px;
-      margin-top: 8px;
-      cursor: pointer;
-      display: block;
-    }
-    .attachment-file {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      background: #2b2d31;
-      padding: 8px 12px;
-      border-radius: 4px;
-      border: 1px solid #1e1f22;
-      margin-top: 8px;
-      text-decoration: none;
-      color: var(--accent);
-      font-weight: 500;
-    }
-    .attachment-file:hover { background: #383a40; }
+        .top-bar {
+            height: 64px;
+            padding: 0 16px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            background: rgba(15, 17, 21, 0.5);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--glass-border);
+        }
 
-    .replybox{
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 4px;
-      color: #b5bac1;
-      font-size: 14px;
-      position: relative;
-    }
-    .replybox::before {
-      content: "";
-      display: block;
-      width: 24px;
-      height: 12px;
-      border-left: 2px solid #4f545c;
-      border-top: 2px solid #4f545c;
-      border-top-left-radius: 6px;
-      margin-right: 4px;
-      transform: translateY(4px);
-    }
-    .replybox .rep-avatar {
-      width: 16px; height: 16px; border-radius: 50%; background: var(--accent); display: inline-block;
-    }
+        #menuToggle {
+            background: none; border: none; color: white; font-size: 24px; cursor: pointer; display: none;
+        }
 
-    .msg-actions {
-      position: absolute;
-      right: 16px;
-      top: -12px;
-      background: #313338;
-      border: 1px solid #1e1f22;
-      border-radius: 4px;
-      display: flex;
-      opacity: 0;
-      transition: opacity .1s ease;
-      box-shadow: 0 0 0 1px rgba(0,0,0,.05), 0 2px 4px rgba(0,0,0,.1);
-      z-index: 5;
-    }
-    .msg-actions button {
-      background: transparent;
-      border: none;
-      color: var(--muted);
-      padding: 4px 8px;
-      cursor: pointer;
-      display: grid;
-      place-items: center;
-    }
-    .msg-actions button:hover {
-      background: rgba(78,80,88,.6);
-      color: #dbdee1;
-    }
-    
-    .reactions {
-      display:flex;
-      gap:4px;
-      flex-wrap:wrap;
-      margin-top:4px;
-    }
-    .reaction {
-      background: #2b2d31;
-      border: 1px solid transparent;
-      border-radius: 6px;
-      padding: 2px 6px;
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      cursor: pointer;
-      font-size: 14px;
-      color: var(--muted);
-    }
-    .reaction:hover {
-      border-color: #5865f2;
-    }
-    .reaction.reacted {
-      background: rgba(88,101,242,.15);
-      border-color: #5865f2;
-    }
+        .message-area { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
 
-    .system{
-      color:#80848e;
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      padding: 8px 16px;
-    }
-    .system .sys-icon {
-      color: var(--accent-2);
-      font-size: 18px;
-      margin-left: 20px;
-    }
-    .system .text{
-      color:#80848e;
-      font-size: 15px;
-    }
-    .system .text b { color: #dbdee1; }
+        .msg-bubble {
+            background: var(--glass);
+            padding: 12px 16px;
+            border-radius: 18px;
+            max-width: 85%;
+            border: 1px solid var(--glass-border);
+            align-self: flex-start;
+        }
 
-    .composer{
-      flex:0 0 auto;
-      padding:0 16px 24px;
-      background:var(--bg);
-      position: relative;
-    }
-    .preview-bar {
-      background: #2b2d31;
-      padding: 8px 12px;
-      border-radius: 8px 8px 0 0;
-      display: none;
-      align-items: center;
-      justify-content: space-between;
-      border: 1px solid rgba(255,255,255,.04);
-      border-bottom: none;
-    }
-    .preview-bar.active { display: flex; }
-    .preview-content { display: flex; align-items: center; gap: 10px; font-size: 14px; }
-    .preview-content img { width: 40px; height: 40px; border-radius: 4px; object-fit: cover; }
-    .remove-attachment { background: none; border: none; color: var(--danger); cursor: pointer; font-weight: bold; }
+        .msg-bubble.own { align-self: flex-end; background: var(--on-primary); border-color: var(--primary); }
 
-    .composer-wrap{
-      display:flex;
-      align-items:flex-start;
-      gap:10px;
-      padding:10px 16px;
-      border-radius:8px;
-      background:#383a40;
-    }
-    .preview-bar.active + .composer-wrap { border-radius: 0 0 8px 8px; }
-    
-    .attach-btn {
-      background: #b5bac1;
-      color: #383a40;
-      border: none;
-      width: 24px;
-      height: 24px;
-      border-radius: 50%;
-      display: grid;
-      place-items: center;
-      cursor: pointer;
-      font-weight: bold;
-      font-size: 18px;
-      line-height: 1;
-      margin-top: -2px;
-      transition: .2s;
-    }
-    .attach-btn:hover { background: #dbdee1; }
+        .msg-meta { font-size: 11px; color: var(--text-muted); margin-bottom: 4px; display: flex; justify-content: space-between; }
 
-    .composer textarea{
-      flex:1;
-      min-height:24px;
-      max-height:400px;
-      height:24px;
-      resize:none;
-      overflow-y:auto;
-      border:none;
-      outline:none;
-      background:transparent;
-      color:var(--text);
-      line-height:1.375rem;
-      font-size:16px;
-      padding:0;
-    }
-    .send{
-      background: transparent;
-      border: none;
-      color: var(--muted);
-      cursor: pointer;
-      display: grid;
-      place-items: center;
-      padding: 0;
-    }
-    .send:hover { color: #fff; }
+        .composer {
+            padding: 16px;
+            background: var(--bg);
+            display: flex;
+            gap: 12px;
+            align-items: flex-end;
+            padding-bottom: calc(16px + env(safe-area-inset-bottom));
+        }
 
-    .members{
-      background:var(--panel);
-      display:flex;
-      flex-direction:column;
-      min-width:0;
-      overflow:hidden;
-    }
-    .members-top{
-      padding:24px 16px 8px;
-      flex:0 0 auto;
-    }
-    .members-top h3{
-      margin:0;
-      font-size:12px;
-      font-weight: 700;
-      text-transform:uppercase;
-      letter-spacing:.02em;
-      color:var(--muted);
-    }
-    .memberlist{
-      padding:8px;
-      overflow-y:auto;
-      min-height:0;
-      flex:1;
-    }
-    .member{
-      display:flex;
-      align-items:center;
-      gap:12px;
-      padding:6px 8px;
-      border-radius:4px;
-      color:var(--muted);
-      cursor: pointer;
-    }
-    .member:hover{background:rgba(78,80,88,.6); color: #dbdee1;}
-    .member .avatar {
-      width: 32px; height: 32px; border-radius: 50%; background: var(--accent); color: #fff; display: grid; place-items: center; font-size: 14px; font-weight: 700; position: relative;
-    }
-    .member .avatar .status {
-      position: absolute; bottom: -2px; right: -2px; width: 12px; height: 12px; background: var(--accent-2); border: 2px solid var(--panel); border-radius: 50%;
-    }
-    .member .name-wrap{
-      min-width:0;
-    }
-    .member .name-wrap strong{
-      display:block;
-      font-size:15px;
-      font-weight: 500;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
+        .composer-box {
+            flex: 1;
+            background: var(--glass);
+            border: 1px solid var(--glass-border);
+            border-radius: 24px;
+            padding: 12px 16px;
+            color: white;
+            max-height: 120px;
+            overflow-y: auto;
+            outline: none;
+            font-size: 16px;
+        }
 
-    .modal-overlay {
-      position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-      background: rgba(0,0,0,.7);
-      display: none; place-items: center; z-index: 100;
-    }
-    .modal-overlay.active { display: grid; }
-    .modal {
-      background: #313338;
-      border-radius: 8px;
-      width: 440px;
-      max-width: 90vw;
-      box-shadow: var(--shadow);
-      display: flex;
-      flex-direction: column;
-    }
-    .modal-header {
-      padding: 24px 24px 0;
-      text-align: center;
-    }
-    .modal-header h2 { margin: 0; font-size: 24px; font-weight: 700; color: #f2f3f5; }
-    .modal-header p { margin: 8px 0 0; color: #b5bac1; font-size: 15px; }
-    .modal-body {
-      padding: 24px;
-    }
-    .modal-body label {
-      display: block; margin-bottom: 8px; color: #b5bac1; font-size: 12px; font-weight: 700; text-transform: uppercase;
-    }
-    .modal-body input {
-      width: 100%; padding: 10px; background: #1e1f22; border: none; border-radius: 4px; color: #dbdee1; font-size: 16px; margin-bottom: 20px;
-    }
-    .modal-footer {
-      padding: 16px 24px;
-      background: #2b2d31;
-      border-radius: 0 0 8px 8px;
-      display: flex;
-      justify-content: flex-end;
-      gap: 12px;
-    }
-    .btn { padding: 10px 24px; border-radius: 4px; border: none; font-size: 14px; font-weight: 500; cursor: pointer; transition: .15s; }
-    .btn-cancel { background: transparent; color: #fff; }
-    .btn-cancel:hover { text-decoration: underline; }
-    .btn-primary { background: var(--accent); color: #fff; }
-    .btn-primary:hover { background: var(--accent-hover); }
+        .btn-round {
+            width: 48px; height: 48px; border-radius: 24px; border: none; background: var(--primary);
+            color: var(--on-primary); font-weight: bold; cursor: pointer; display: flex; align-items: center; justify-content: center;
+        }
 
-    .emoji-picker {
-      position: absolute;
-      background: #2b2d31;
-      border: 1px solid #1e1f22;
-      border-radius: 8px;
-      padding: 8px;
-      display: none;
-      gap: 8px;
-      box-shadow: var(--shadow);
-      z-index: 50;
-    }
-    .emoji-picker.active { display: flex; }
-    .emoji-picker span {
-      font-size: 24px; cursor: pointer; padding: 4px; border-radius: 4px; transition: background .1s;
-    }
-    .emoji-picker span:hover { background: rgba(255,255,255,.1); }
-
-    @media (max-width: 1100px){
-      .app{grid-template-columns:72px 240px minmax(0,1fr);}
-      .members{display:none}
-      .titleblock p{display:none}
-    }
-    @media (max-width: 820px){
-      .app{
-        height: 100vh;
-        grid-template-columns:1fr;
-        grid-template-rows: auto 1fr;
-      }
-      .servers,.sidebar,.members{ display:none; }
-      .search{width: 100px;}
-      .search:focus { width: 140px; }
-      .msg { padding: 4px 8px; }
-    }
-  </style>
+        /* Mobile Adjustments */
+        @media (max-width: 800px) {
+            #menuToggle { display: block; }
+            .sidebar {
+                position: absolute;
+                transform: translateX(-100%);
+            }
+            .sidebar.open { transform: translateX(0); }
+            .overlay {
+                display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 999;
+            }
+            .sidebar.open + .overlay { display: block; }
+        }
+    </style>
 </head>
 <body>
-  <div class="app">
-    <aside class="servers" id="servers"></aside>
-
-    <aside class="sidebar">
-      <div class="side-top">
-        <div class="brand">
-          <div>
-            <h1>LinkUp</h1>
-          </div>
-        </div>
-      </div>
-
-      <div class="section">
-        <div class="section-title">Channels</div>
-        <div id="channels"></div>
-      </div>
-
-      <div class="user-controls">
-         <div class="user-info" id="userProfileBtn">
-           <div class="avatar"><span id="myAvatarInitial">U</span><div class="status"></div></div>
-           <div class="user-text">
-             <strong id="myNameDisplay">You</strong>
-             <span>#<span id="myIdDisplay">0000</span></span>
-           </div>
-         </div>
-         <button id="settingsBtn" title="User Settings">⚙️</button>
-      </div>
-    </aside>
-
-    <main class="main">
-      <div class="main-top">
-        <div class="titleblock">
-          <span class="hash">#</span>
-          <h2 id="channelTitle">general</h2>
-          <div class="divider"></div>
-          <p id="channelDescription">A big, readable room for real-time chat.</p>
-        </div>
-        <div class="top-actions">
-           <div class="search-container">
-             <input class="search" id="searchInput" placeholder="Search" />
-           </div>
-           <div id="connState" style="color:var(--muted); font-size: 12px;">connecting...</div>
-        </div>
-      </div>
-
-      <div class="messages" id="messages"></div>
-
-      <div class="typing" id="typingLine"></div>
-
-      <div class="composer">
-        <div class="preview-bar" id="attachmentPreview">
-           <div class="preview-content" id="attachmentContent"></div>
-           <button class="remove-attachment" id="removeAttachmentBtn">X</button>
-        </div>
-        <div class="composer-wrap">
-          <button id="attachBtn" class="attach-btn" title="Upload a file or image">+</button>
-          <input type="file" id="fileInput" style="display:none;" />
-          <textarea id="messageInput" placeholder="Message #general"></textarea>
-          <button class="send" id="sendBtn" title="Send message">
-             <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
-          </button>
-        </div>
-      </div>
-    </main>
-
-    <aside class="members">
-      <div class="members-top">
-        <h3>Online — <span id="statUsers">0</span></h3>
-      </div>
-      <div class="memberlist" id="members"></div>
-    </aside>
-  </div>
-
-  <div class="modal-overlay" id="settingsModal">
-     <div class="modal">
-        <div class="modal-header">
-           <h2>User Settings</h2>
-           <p>Change how you appear to others.</p>
-        </div>
-        <div class="modal-body">
-           <label>Display Name</label>
-           <input type="text" id="nameChangeInput" placeholder="Enter new name" />
-        </div>
-        <div class="modal-footer">
-           <button class="btn btn-cancel" id="closeSettings">Cancel</button>
-           <button class="btn btn-primary" id="saveSettings">Save Changes</button>
-        </div>
-     </div>
-  </div>
-
-  <div class="emoji-picker" id="emojiPicker">
-     <span>👍</span><span>❤️</span><span>😂</span><span>🔥</span><span>👀</span><span>💯</span>
-  </div>
-
-<script>
-(() => {
-  const servers = [
-    { id: "home", name: "L", label: "LinkUp Hub" },
-    { id: "dev", name: "D", label: "Dev Base" },
-    { id: "games", name: "G", label: "Game Squad" },
-    { id: "study", name: "S", label: "Study Zone" }
-  ];
-
-  const channelsByServer = {
-    home: [
-      { id: "general", title: "general", description: "Main feed for everything LinkUp." },
-      { id: "announcements", title: "announcements", description: "Product updates, releases, and changelogs." },
-      { id: "showcase", title: "showcase", description: "Drop cool projects, screenshots, and wins." }
-    ],
-    dev: [
-      { id: "frontend", title: "frontend", description: "UI, components, and layout experiments." },
-      { id: "backend", title: "backend", description: "APIs, database, auth, and server logic." },
-      { id: "bugs", title: "bugs", description: "Report issues and weird behavior here." }
-    ],
-    games: [
-      { id: "lobby", title: "lobby", description: "Find players and set up sessions." },
-      { id: "clips", title: "clips", description: "Highlights, funny moments, and screenshots." },
-      { id: "meta", title: "meta", description: "Discuss builds, balance, and strategy." }
-    ],
-    study: [
-      { id: "math", title: "math", description: "Problem solving and homework help." },
-      { id: "coding", title: "coding", description: "Programming help and pair debugging." },
-      { id: "focus", title: "focus", description: "Quiet study time and accountability." }
-    ]
-  };
-
-  const els = {
-    servers: document.getElementById("servers"),
-    channels: document.getElementById("channels"),
-    messages: document.getElementById("messages"),
-    channelTitle: document.getElementById("channelTitle"),
-    channelDescription: document.getElementById("channelDescription"),
-    connState: document.getElementById("connState"),
-    messageInput: document.getElementById("messageInput"),
-    sendBtn: document.getElementById("sendBtn"),
-    members: document.getElementById("members"),
-    typingLine: document.getElementById("typingLine"),
-    statUsers: document.getElementById("statUsers"),
-    searchInput: document.getElementById("searchInput"),
-    
-    myAvatarInitial: document.getElementById("myAvatarInitial"),
-    myNameDisplay: document.getElementById("myNameDisplay"),
-    myIdDisplay: document.getElementById("myIdDisplay"),
-    settingsBtn: document.getElementById("settingsBtn"),
-    userProfileBtn: document.getElementById("userProfileBtn"),
-    settingsModal: document.getElementById("settingsModal"),
-    nameChangeInput: document.getElementById("nameChangeInput"),
-    closeSettings: document.getElementById("closeSettings"),
-    saveSettings: document.getElementById("saveSettings"),
-    emojiPicker: document.getElementById("emojiPicker"),
-    
-    attachBtn: document.getElementById("attachBtn"),
-    fileInput: document.getElementById("fileInput"),
-    attachmentPreview: document.getElementById("attachmentPreview"),
-    attachmentContent: document.getElementById("attachmentContent"),
-    removeAttachmentBtn: document.getElementById("removeAttachmentBtn"),
-  };
-
-  const localClientId = localStorage.getItem("linkup_client_id") || ("cli_" + Math.random().toString(36).slice(2, 10));
-  localStorage.setItem("linkup_client_id", localClientId);
-  let savedName = localStorage.getItem("linkup_name") || "Guest";
-
-  let displayName = savedName;
-  let selectedServer = localStorage.getItem("linkup_server") || "home";
-  let selectedChannel = localStorage.getItem("linkup_channel") || "general";
-
-  els.myIdDisplay.textContent = localClientId.slice(-4);
-
-  let socket = null;
-  let connectionSeq = 0;
-  let reconnectTimer = null;
-  let handshakeTimer = null;
-  let retryCount = 0;
-  let typingTimeout = null;
-  let replyTo = null;
-  let activeEmojiTarget = null;
-  let lastMessageSender = null;
-  let lastMessageTime = 0;
-  let editingMessageId = null;
-  
-  let currentAttachment = null;
-
-  const roomMessages = new Map();
-  const roomSeen = new Map();
-  const roomPresence = new Map();
-
-  function updateUserInfo() {
-    els.myNameDisplay.textContent = displayName;
-    els.myAvatarInitial.textContent = displayName.charAt(0).toUpperCase();
-    localStorage.setItem("linkup_name", displayName);
-  }
-  updateUserInfo();
-
-  function parseMarkdown(text) {
-    if (!text) return "";
-    let esc = String(text).replace(/[&<>"']/g, s => ({"&": "&amp;","<": "&lt;",">": "&gt;","\"": "&quot;","'": "&#39;"}[s]));
-    esc = esc.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
-    esc = esc.replace(/\*(.*?)\*/g, '<i>$1</i>');
-    esc = esc.replace(/`(.*?)`/g, '<code>$1</code>');
-    esc = esc.replace(/```([\s\S]*?)```/g, '<pre>$1</pre>');
-    // Simple URL parsing
-    esc = esc.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" style="color:var(--accent); text-decoration:none;">$1</a>');
-    return esc;
-  }
-
-  function fmtTime(ts) {
-    return new Date(ts || Date.now()).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-  }
-
-  function fmtDateDiscord(ts) {
-    const d = new Date(ts || Date.now());
-    const today = new Date();
-    const yesterday = new Date(today);
-    yesterday.setDate(yesterday.getDate() - 1);
-    
-    if (d.toDateString() === today.toDateString()) return "Today at " + fmtTime(ts);
-    if (d.toDateString() === yesterday.toDateString()) return "Yesterday at " + fmtTime(ts);
-    return d.toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" }) + " " + fmtTime(ts);
-  }
-
-  function currentChannel() {
-    const list = channelsByServer[selectedServer] || [];
-    return list.find(c => c.id === selectedChannel) || list[0];
-  }
-
-  function roomId() {
-    return `${selectedServer}:${selectedChannel}`;
-  }
-
-  function setStatus(text, connected = false) {
-    els.connState.textContent = text;
-    els.connState.style.color = connected ? "#23a559" : "var(--muted)";
-  }
-
-  function ensureRoom(room) {
-    if (!roomMessages.has(room)) {
-      roomMessages.set(room, []);
-      roomSeen.set(room, new Set());
-      roomPresence.set(room, []);
-    }
-  }
-
-  function currentUsers() {
-    ensureRoom(roomId());
-    return roomPresence.get(roomId()) || [];
-  }
-
-  function seenSet(room) {
-    ensureRoom(room);
-    return roomSeen.get(room);
-  }
-
-  function roomList() {
-    ensureRoom(roomId());
-    return roomMessages.get(roomId());
-  }
-
-  // File Upload Logic
-  els.attachBtn.onclick = () => els.fileInput.click();
-  
-  els.fileInput.onchange = (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    if (file.size > 5 * 1024 * 1024) { // 5MB limit
-      alert("File is too large (max 5MB limit for this demo).");
-      return;
-    }
-    const reader = new FileReader();
-    reader.onload = () => {
-      currentAttachment = {
-        name: file.name,
-        type: file.type,
-        data: reader.result
-      };
-      showAttachmentPreview();
-    };
-    reader.readAsDataURL(file);
-    els.fileInput.value = ""; // reset
-  };
-
-  function showAttachmentPreview() {
-    if (!currentAttachment) return;
-    els.attachmentPreview.classList.add("active");
-    if (currentAttachment.type.startsWith("image/")) {
-      els.attachmentContent.innerHTML = `<img src="${currentAttachment.data}" /> <span>${currentAttachment.name}</span>`;
-    } else {
-      els.attachmentContent.innerHTML = `<span>📁 ${currentAttachment.name}</span>`;
-    }
-  }
-  
-  els.removeAttachmentBtn.onclick = () => {
-    currentAttachment = null;
-    els.attachmentPreview.classList.remove("active");
-  };
-
-  function renderServers() {
-    els.servers.innerHTML = servers.map(s => `
-      <button class="server-btn ${s.id === selectedServer ? "active" : ""}" data-server="${s.id}" title="${s.label}">
-        ${s.name}
-      </button>
-    `).join("");
-
-    els.servers.querySelectorAll("button").forEach(btn => {
-      btn.onclick = () => {
-        selectedServer = btn.dataset.server;
-        selectedChannel = channelsByServer[selectedServer][0].id;
-        resetComposer();
-        localStorage.setItem("linkup_server", selectedServer);
-        localStorage.setItem("linkup_channel", selectedChannel);
-        renderShell();
-        connectSocket(true);
-      };
-    });
-  }
-
-  function renderChannels() {
-    els.channels.innerHTML = (channelsByServer[selectedServer] || []).map(ch => `
-      <button class="channel ${ch.id === selectedChannel ? "active" : ""}" data-channel="${ch.id}">
-        <span class="hash">#</span>
-        <div class="meta">
-          <strong>${ch.title}</strong>
-        </div>
-      </button>
-    `).join("");
-
-    els.channels.querySelectorAll("button").forEach(btn => {
-      btn.onclick = () => {
-        selectedChannel = btn.dataset.channel;
-        resetComposer();
-        localStorage.setItem("linkup_channel", selectedChannel);
-        els.messageInput.placeholder = `Message #${selectedChannel}`;
-        renderShell();
-        connectSocket(true);
-      };
-    });
-  }
-
-  function resetComposer() {
-    replyTo = null;
-    editingMessageId = null;
-    currentAttachment = null;
-    els.attachmentPreview.classList.remove("active");
-    els.messageInput.value = "";
-    els.messageInput.style.height = '24px';
-  }
-
-  function renderTop() {
-    const ch = currentChannel();
-    els.channelTitle.textContent = ch ? ch.title : "general";
-    els.channelDescription.textContent = ch ? ch.description : "";
-    els.messageInput.placeholder = `Message #${selectedChannel}`;
-  }
-
-  function renderMembers() {
-    const users = currentUsers();
-    els.statUsers.textContent = String(users.length);
-
-    els.members.innerHTML = users.length ? users.map(u => `
-      <div class="member">
-        <div class="avatar">${(u.name||"?").charAt(0).toUpperCase()}<div class="status"></div></div>
-        <div class="name-wrap">
-          <strong>${parseMarkdown(u.name)}</strong>
-        </div>
-      </div>
-    `).join("") : `<div class="member" style="color:var(--muted)">No one else yet</div>`;
-  }
-
-  function renderMessageHtml(m, isCompact = false) {
-    const reactions = m.reactions || {};
-    const reactionKeys = Object.keys(reactions);
-    const initial = (m.name || "?").trim().slice(0, 1).toUpperCase();
-    const isSelf = m.client_id === localClientId;
-
-    if (m.kind === "system") {
-      return `
-        <div class="system" data-id="${parseMarkdown(m.msg_id)}">
-          <div class="sys-icon">➜</div>
-          <div class="text">${parseMarkdown(m.text)}</div>
-        </div>
-      `;
-    }
-    
-    let attachHtml = "";
-    if (m.attachment) {
-      if (m.attachment.type.startsWith("image/")) {
-        attachHtml = `<img src="${m.attachment.data}" class="attachment-img" alt="Attachment" />`;
-      } else {
-        attachHtml = `<a href="${m.attachment.data}" download="${m.attachment.name}" class="attachment-file">📄 ${m.attachment.name}</a>`;
-      }
-    }
-
-    return `
-      <div class="msg ${isCompact ? 'compact' : ''}" data-id="${parseMarkdown(m.msg_id)}" id="msg_${m.msg_id}">
-        ${isCompact ? `<div class="compact-time">${fmtTime(m.time)}</div>` : `<div class="avatar-wrapper">${initial}</div>`}
-        <div class="content">
-          ${!isCompact ? `
-          <div class="header">
-            <div class="name">${parseMarkdown(m.name || "Guest")}</div>
-            <div class="time">${fmtDateDiscord(m.time)}</div>
-          </div>
-          ` : ''}
-          ${m.reply_preview ? `
-            <div class="replybox">
-              <div class="rep-avatar"></div>
-              <span><b>${parseMarkdown(m.reply_preview.name || "Guest")}</b> ${parseMarkdown((m.reply_preview.text || "").slice(0, 60))}</span>
+    <div class="app-shell">
+        <aside class="sidebar" id="sidebar">
+            <div class="side-header">
+                <h1>Nasoro</h1>
             </div>
-          ` : ""}
-          <div class="text">${parseMarkdown(m.text || "")}${m.edited ? '<span class="edited-mark">(edited)</span>' : ''}</div>
-          ${attachHtml}
-          <div class="reactions">
-            ${reactionKeys.map(e => `
-              <div class="reaction ${reactions[e] > 0 ? 'reacted' : ''}" data-action="react" data-id="${parseMarkdown(m.msg_id)}" data-emoji="${e}">
-                ${e} <span>${reactions[e]}</span>
-              </div>
-            `).join("")}
-          </div>
-          <div class="msg-actions">
-            <button data-action="react-prompt" data-id="${parseMarkdown(m.msg_id)}" title="Add Reaction">😊</button>
-            <button data-action="reply" data-id="${parseMarkdown(m.msg_id)}" title="Reply">↩️</button>
-            ${isSelf ? `
-            <button data-action="edit" data-id="${parseMarkdown(m.msg_id)}" title="Edit">✏️</button>
-            <button data-action="delete" data-id="${parseMarkdown(m.msg_id)}" title="Delete" style="color:var(--danger)">🗑️</button>
-            ` : ''}
-          </div>
-        </div>
-      </div>
-    `;
-  }
+            <div class="user-config">
+                <input type="text" id="usernameInput" class="m3-input" placeholder="Change display name...">
+                <button class="btn-round" style="width: 100%; border-radius: 12px;" onclick="updateName()">Update Profile</button>
+            </div>
+            <div class="channel-list" id="channels">
+                <div class="channel-item active" onclick="switchRoom('general')"># general</div>
+                <div class="channel-item" onclick="switchRoom('dev')"># dev-base</div>
+                <div class="channel-item" onclick="switchRoom('showcase')"># showcase</div>
+            </div>
+        </aside>
+        <div class="overlay" onclick="toggleMenu()"></div>
 
-  function applyFilter(room) {
-    const q = (els.searchInput.value || "").trim().toLowerCase();
-    return roomList(room).filter(m => {
-      if (m.kind === "system") return true;
-      if (!q) return true;
-      return String(m.text || "").toLowerCase().includes(q) || String(m.name || "").toLowerCase().includes(q);
-    });
-  }
+        <main class="main-content">
+            <header class="top-bar">
+                <button id="menuToggle" onclick="toggleMenu()">☰</button>
+                <h2 id="roomTitle"># general</h2>
+            </header>
 
-  function renderMessages() {
-    ensureRoom(roomId());
-    const msgs = applyFilter(roomId());
-    let html = "";
-    lastMessageSender = null;
-    lastMessageTime = 0;
+            <div class="message-area" id="msgFeed"></div>
 
-    msgs.forEach(m => {
-      const isCompact = (m.kind === "message" && m.client_id === lastMessageSender && (m.time - lastMessageTime < 300000) && !m.reply_preview);
-      html += renderMessageHtml(m, isCompact);
-      if (m.kind === "message") {
-        lastMessageSender = m.client_id;
-        lastMessageTime = m.time;
-      } else {
-        lastMessageSender = null;
-      }
-    });
+            <div class="composer">
+                <div class="composer-box" id="composer" contenteditable="true" placeholder="Message Nasoro..."></div>
+                <button class="btn-round" onclick="sendMsg()">➤</button>
+            </div>
+        </main>
+    </div>
 
-    els.messages.innerHTML = html;
-    scrollToBottom(true);
-    bindMessageActions();
-  }
-  
-  function scrollToBottom(force = false) {
-    const threshold = 100;
-    const isAtBottom = els.messages.scrollHeight - els.messages.clientHeight <= els.messages.scrollTop + threshold;
-    if (force || isAtBottom) {
-      els.messages.scrollTop = els.messages.scrollHeight;
-    }
-  }
+    <script>
+        let currentRoom = 'general';
+        let socket = null;
+        let clientId = localStorage.getItem('nas_cid') || 'cli_' + Math.random().toString(36).substr(2, 9);
+        let userName = localStorage.getItem('nas_name') || 'User';
+        localStorage.setItem('nas_cid', clientId);
 
-  function renderShell() {
-    lastMessageSender = null;
-    renderServers();
-    renderChannels();
-    renderTop();
-    renderMembers();
-    renderMessages();
-  }
+        document.getElementById('usernameInput').value = userName;
 
-  function pushMessage(room, msg, renderNow = true) {
-    ensureRoom(room);
-    if (!msg.msg_id) msg.msg_id = "msg_" + Math.random().toString(36).slice(2, 12);
+        function connect() {
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            socket = new WebSocket(`${proto}://${location.host}/ws/${currentRoom}`);
 
-    const seen = seenSet(room);
-    if (seen.has(msg.msg_id)) return;
-    seen.add(msg.msg_id);
+            socket.onopen = () => {
+                socket.send(JSON.stringify({ kind: 'hello', client_id: clientId, name: userName }));
+            };
 
-    msg.reactions = msg.reactions || {};
-    roomList().push(msg);
+            socket.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                if (data.kind === 'message') appendMsg(data);
+                if (data.kind === 'history') {
+                    document.getElementById('msgFeed').innerHTML = '';
+                    data.messages.forEach(appendMsg);
+                }
+            };
 
-    if (room === roomId() && renderNow) {
-      const isCompact = (msg.kind === "message" && msg.client_id === lastMessageSender && (msg.time - lastMessageTime < 300000) && !msg.reply_preview);
-      els.messages.insertAdjacentHTML("beforeend", renderMessageHtml(msg, isCompact));
-      scrollToBottom();
-      if (msg.kind === "message") {
-        lastMessageSender = msg.client_id;
-        lastMessageTime = msg.time;
-      } else {
-        lastMessageSender = null;
-      }
-      bindMessageActions();
-    }
-  }
+            socket.onclose = () => setTimeout(connect, 2000);
+        }
 
-  function wsUrl(room) {
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    return `${proto}://${location.host}/ws/${encodeURIComponent(room)}`;
-  }
+        function appendMsg(m) {
+            const feed = document.getElementById('msgFeed');
+            const isOwn = m.client_id === clientId;
+            const div = document.createElement('div');
+            div.className = `msg-bubble ${isOwn ? 'own' : ''}`;
+            div.innerHTML = `
+                <div class="msg-meta">
+                    <strong>${m.name}</strong>
+                    <span>${new Date(m.time).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})}</span>
+                </div>
+                <div class="text">${m.text}</div>
+            `;
+            feed.appendChild(div);
+            feed.scrollTop = feed.scrollHeight;
+        }
 
-  function cleanupSocketTimers() {
-    if (reconnectTimer) clearTimeout(reconnectTimer);
-    if (handshakeTimer) clearTimeout(handshakeTimer);
-    reconnectTimer = null;
-    handshakeTimer = null;
-  }
+        function sendMsg() {
+            const box = document.getElementById('composer');
+            const text = box.innerText.trim();
+            if (!text || !socket) return;
+            socket.send(JSON.stringify({ kind: 'message', text: text, client_id: clientId, name: userName }));
+            box.innerText = '';
+        }
 
-  function scheduleReconnect(seq) {
-    if (seq !== connectionSeq) return;
-    const delay = Math.min(1000 * Math.pow(2, retryCount), 10000);
-    retryCount += 1;
+        function updateName() {
+            userName = document.getElementById('usernameInput').value.trim() || 'User';
+            localStorage.setItem('nas_name', userName);
+            if (socket) socket.send(JSON.stringify({ kind: 'rename', name: userName, client_id: clientId }));
+        }
 
-    reconnectTimer = setTimeout(() => {
-      if (seq !== connectionSeq) return;
-      connectSocket(false);
-    }, delay);
+        function switchRoom(id) {
+            if (id === currentRoom) return;
+            currentRoom = id;
+            document.getElementById('roomTitle').innerText = '# ' + id;
+            document.querySelectorAll('.channel-item').forEach(el => el.classList.remove('active'));
+            event.currentTarget.classList.add('active');
+            if (socket) socket.close();
+            if (window.innerWidth < 800) toggleMenu();
+        }
 
-    setTimeout(() => {
-      if (seq !== connectionSeq) return;
-      if (!socket || socket.readyState !== WebSocket.OPEN) {
-        setStatus(`reconnecting in ${Math.ceil(delay / 1000)}s`);
-      }
-    }, 20);
-  }
+        function toggleMenu() {
+            document.getElementById('sidebar').classList.toggle('open');
+        }
 
-  function connectSocket(force = false) {
-    cleanupSocketTimers();
-    const seq = ++connectionSeq;
-    const room = roomId();
-    let opened = false;
-
-    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
-      try { socket.close(1000, "switch"); } catch {}
-    }
-
-    roomPresence.set(room, []);
-    els.typingLine.textContent = "";
-    setStatus("connecting...");
-
-    try { socket = new WebSocket(wsUrl(room)); } catch {
-      setStatus("socket unavailable"); scheduleReconnect(seq); return;
-    }
-
-    handshakeTimer = setTimeout(() => {
-      if (seq !== connectionSeq) return;
-      if (!opened) setStatus("connecting... still trying");
-    }, 4000);
-
-    socket.onopen = () => {
-      if (seq !== connectionSeq) { try { socket.close(1000, "stale"); } catch {} return; }
-      opened = true; retryCount = 0; cleanupSocketTimers();
-      setStatus("connected", true);
-      socket.send(JSON.stringify({ kind: "hello", client_id: localClientId, name: displayName, room, time: Date.now() }));
-    };
-
-    socket.onmessage = (event) => {
-      if (seq !== connectionSeq) return;
-      let data = null;
-      try { data = JSON.parse(event.data); } catch { return; }
-      if (!data) return;
-
-      if (data.kind === "history") {
-        roomMessages.set(room, []); roomSeen.set(room, new Set());
-        roomPresence.set(room, Array.isArray(data.users) ? data.users : []);
-        (Array.isArray(data.messages) ? data.messages : []).forEach(m => {
-          if (!m.msg_id) m.msg_id = "hist_" + Math.random().toString(36).slice(2, 12);
-          seenSet(room).add(m.msg_id);
-          if (!m.reactions) m.reactions = {};
-          roomMessages.get(room).push(m);
+        // Enter key to send
+        document.getElementById('composer').addEventListener('keydown', e => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMsg();
+            }
         });
-        renderMembers(); renderMessages(); return;
-      }
 
-      if (data.kind === "presence") {
-        roomPresence.set(room, Array.isArray(data.users) ? data.users : []);
-        renderMembers(); return;
-      }
-
-      if (data.kind === "typing") {
-        if (data.client_id && data.client_id !== localClientId) {
-          els.typingLine.textContent = `${data.name || "Someone"} is typing...`;
-          clearTimeout(typingTimeout);
-          typingTimeout = setTimeout(() => els.typingLine.textContent = "", 1500);
-        }
-        return;
-      }
-
-      if (data.kind === "system") { pushMessage(room, data, true); return; }
-
-      if (data.kind === "reaction_update") {
-        const target = roomList().find(m => m.msg_id === data.msg_id);
-        if (target) { target.reactions = data.reactions || {}; renderMessages(); }
-        return;
-      }
-      
-      if (data.kind === "edit_update") {
-        const target = roomList().find(m => m.msg_id === data.msg_id);
-        if (target) { target.text = data.text; target.edited = true; renderMessages(); }
-        return;
-      }
-      
-      if (data.kind === "delete_update") {
-        const list = roomList();
-        const idx = list.findIndex(m => m.msg_id === data.msg_id);
-        if (idx !== -1) { list.splice(idx, 1); renderMessages(); }
-        return;
-      }
-
-      if (data.kind === "message") {
-        data.time = data.time || Date.now();
-        data.client_id = data.client_id || "remote";
-        data.msg_id = data.msg_id || `srv_${room}_${data.time}_${Math.random().toString(36).slice(2, 8)}`;
-        data.reactions = data.reactions || {};
-        pushMessage(room, data, true);
-      }
-    };
-
-    socket.onerror = () => { if (seq === connectionSeq && !opened) setStatus("connection error"); };
-    socket.onclose = () => { if (seq === connectionSeq) { cleanupSocketTimers(); setStatus(opened ? "disconnected" : "offline"); scheduleReconnect(seq); } };
-  }
-
-  function sendTyping() {
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify({ kind: "typing", client_id: localClientId, name: displayName, room: roomId(), time: Date.now() }));
-  }
-
-  function sendMessage() {
-    const text = els.messageInput.value.trim();
-    if (!text && !currentAttachment) return;
-
-    // Handle Editing existing message
-    if (editingMessageId) {
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({
-          kind: "edit",
-          msg_id: editingMessageId,
-          text: text,
-          client_id: localClientId,
-          room: roomId(),
-          time: Date.now()
-        }));
-      }
-      resetComposer();
-      els.messageInput.placeholder = `Message #${selectedChannel}`;
-      return;
-    }
-
-    // New Message
-    const payload = {
-      kind: "message",
-      msg_id: `cli_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
-      client_id: localClientId,
-      name: displayName,
-      text,
-      room: roomId(),
-      reply_to: replyTo,
-      attachment: currentAttachment,
-      time: Date.now()
-    };
-
-    if (replyTo) {
-      const original = roomList().find(m => m.msg_id === replyTo);
-      if (original) payload.reply_preview = { msg_id: original.msg_id, name: original.name, text: original.text };
-    }
-
-    pushMessage(roomId(), payload, true);
-    if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
-
-    resetComposer();
-    els.messageInput.placeholder = `Message #${selectedChannel}`;
-    els.messageInput.focus();
-  }
-
-  function handleReaction(id, emoji) {
-    if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    socket.send(JSON.stringify({ kind: "reaction", client_id: localClientId, name: displayName, room: roomId(), msg_id: id, emoji: emoji, time: Date.now() }));
-  }
-
-  function bindMessageActions() {
-    els.messages.querySelectorAll("[data-action]").forEach(btn => {
-      btn.onclick = (e) => {
-        const action = btn.dataset.action;
-        const id = btn.dataset.id;
-        const room = roomId();
-
-        if (action === "reply") {
-          replyTo = id;
-          const original = roomList().find(m => m.msg_id === id);
-          els.messageInput.placeholder = original ? `Replying to ${original.name}` : "Replying...";
-          els.messageInput.focus();
-          return;
-        }
-        
-        if (action === "edit") {
-          editingMessageId = id;
-          const original = roomList().find(m => m.msg_id === id);
-          if (original) {
-            els.messageInput.value = original.text;
-            els.messageInput.placeholder = "Editing message...";
-            els.messageInput.focus();
-          }
-          return;
-        }
-
-        if (action === "delete") {
-          if (confirm("Are you sure you want to delete this message?")) {
-            if (!socket || socket.readyState !== WebSocket.OPEN) return;
-            socket.send(JSON.stringify({ kind: "delete", client_id: localClientId, room, msg_id: id }));
-          }
-          return;
-        }
-
-        if (action === "react") {
-          handleReaction(id, btn.dataset.emoji);
-          return;
-        }
-
-        if (action === "react-prompt") {
-          const rect = btn.getBoundingClientRect();
-          els.emojiPicker.style.top = `${rect.top - 40}px`;
-          els.emojiPicker.style.left = `${Math.max(10, rect.left - 150)}px`;
-          els.emojiPicker.classList.add("active");
-          activeEmojiTarget = id;
-          e.stopPropagation();
-        }
-      };
-    });
-  }
-
-  document.addEventListener("click", (e) => {
-    if (!els.emojiPicker.contains(e.target)) {
-      els.emojiPicker.classList.remove("active");
-      activeEmojiTarget = null;
-    }
-  });
-
-  els.emojiPicker.querySelectorAll("span").forEach(span => {
-    span.onclick = () => {
-      if (activeEmojiTarget) handleReaction(activeEmojiTarget, span.textContent);
-      els.emojiPicker.classList.remove("active");
-      activeEmojiTarget = null;
-    };
-  });
-
-  els.searchInput.addEventListener("input", renderMessages);
-
-  els.messageInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
-    if (e.key === "Escape" && editingMessageId) {
-      resetComposer();
-      els.messageInput.placeholder = `Message #${selectedChannel}`;
-    }
-  });
-
-  els.messageInput.addEventListener("input", () => {
-    els.messageInput.style.height = '24px';
-    els.messageInput.style.height = els.messageInput.scrollHeight + 'px';
-    sendTyping();
-  });
-
-  els.sendBtn.onclick = sendMessage;
-
-  // Settings Modal Logic
-  function openSettings() {
-    els.nameChangeInput.value = displayName;
-    els.settingsModal.classList.add("active");
-    els.nameChangeInput.focus();
-  }
-  function closeSettings() { els.settingsModal.classList.remove("active"); }
-
-  els.settingsBtn.onclick = openSettings;
-  els.userProfileBtn.onclick = openSettings;
-  els.closeSettings.onclick = closeSettings;
-  els.saveSettings.onclick = () => {
-    const newName = els.nameChangeInput.value.trim().slice(0, 24);
-    if (newName && newName !== displayName) {
-      displayName = newName;
-      updateUserInfo();
-      if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ kind: "rename", client_id: localClientId, name: displayName, room: roomId(), time: Date.now() }));
-      }
-    }
-    closeSettings();
-  };
-
-  window.addEventListener("online", () => { setStatus("back online"); connectSocket(true); });
-  window.addEventListener("offline", () => { setStatus("offline"); });
-
-  renderShell();
-  connectSocket(true);
-})();
-</script>
+        connect();
+    </script>
 </body>
 </html>"""
-
 
 @app.get("/", response_class=HTMLResponse)
 def root():
     return HTMLResponse(content=page_html())
 
-
 @app.get("/health")
 def health():
-    return {"ok": True, "app": "LinkUp"}
+    return {"status": "online", "project": "Nasoro LinkUp"}
 
-
-@app.get("/api")
-def api_root():
-    return {"message": "LinkUp API is live", "websocket": "/ws/{room_id}"}
-
-
-@app.get("/{path:path}", response_class=HTMLResponse)
-def spa_fallback(path: str):
-    return HTMLResponse(content=page_html())
 
 
