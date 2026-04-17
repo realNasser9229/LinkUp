@@ -20,3 +20,5 @@ uvicorn app.main:app --reload
 ```
 
 # Enjoy using LinkUp!
+
+[Try LinkUp here!](<https://linkup-1-qqp5.onrender.com>)
