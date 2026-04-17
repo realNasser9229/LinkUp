@@ -131,14 +131,13 @@ class RoomState:
         else:
             bucket.add(client_id)
 
-        counts = {}
-        for e, users in self.reactions[room][msg_id].items():
-            counts[e] = len(users)
+        counts = {e: len(users) for e, users in self.reactions[room][msg_id].items()}
+        return {"msg_id": msg_id, "reactions": counts}
 
-        return {
-            "msg_id": msg_id,
-            "reactions": counts,
-        }
+    def set_message_reactions(self, room: str, msg_id: str, reactions: dict) -> None:
+        msg = self.get_message_by_id(room, msg_id)
+        if msg:
+            msg["reactions"] = reactions
 
     async def send_history(self, room: str, ws: WebSocket) -> None:
         self.ensure(room)
@@ -172,6 +171,7 @@ class RoomState:
                 await ws.send_json(payload)
             except Exception:
                 dead.append(client_id)
+
         for client_id in dead:
             self.remove(room, client_id)
 
@@ -274,6 +274,7 @@ async def room_socket(websocket: WebSocket, room_id: str):
                 result = rooms.toggle_reaction(room_id, msg_id, emoji, client_id)
                 if not result:
                     continue
+                rooms.set_message_reactions(room_id, msg_id, result["reactions"])
                 await rooms.broadcast(
                     room_id,
                     {
@@ -312,7 +313,6 @@ async def room_socket(websocket: WebSocket, room_id: str):
                 "reply_to": reply_to,
                 "reply_preview": reply_preview,
                 "reactions": {},
-                "pinned": False,
             }
 
             rooms.append_history(room_id, message)
@@ -338,129 +338,129 @@ def page_html() -> str:
   <title>LinkUp</title>
   <style>
     :root{
-      --bg:#050812;
-      --panel:rgba(12, 18, 37, .90);
-      --panel2:rgba(17, 26, 51, .96);
-      --line:rgba(255,255,255,.08);
-      --text:#eef3ff;
-      --muted:#9aa8cf;
-      --accent:#7b8cff;
-      --accent2:#66efc0;
-      --shadow:0 30px 90px rgba(0,0,0,.42);
-      --radius:24px;
+      --bg:#313338;
+      --panel:#2b2d31;
+      --panel-2:#1e1f22;
+      --panel-3:#383a40;
+      --line:rgba(255,255,255,.06);
+      --text:#f2f3f5;
+      --muted:#b5bac1;
+      --accent:#5865f2;
+      --accent-2:#3ba55d;
+      --shadow:0 16px 50px rgba(0,0,0,.30);
+      --radius:0;
       color-scheme: dark;
     }
     *{box-sizing:border-box}
     html,body{height:100%}
     body{
       margin:0;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background:var(--bg);
       color:var(--text);
-      background:
-        radial-gradient(circle at 0% 0%, rgba(123,140,255,.18), transparent 22%),
-        radial-gradient(circle at 100% 0%, rgba(102,239,192,.10), transparent 20%),
-        linear-gradient(180deg, #050812 0%, #070d18 100%);
+      overflow:hidden;
     }
     button,input,textarea{font:inherit}
+
     .app{
-      min-height:100vh;
-      padding:16px;
+      height:100vh;
       display:grid;
-      grid-template-columns: 92px 286px minmax(0,1fr) 380px;
-      gap:16px;
-    }
-    .glass{
-      background:var(--panel);
-      border:1px solid var(--line);
-      box-shadow:var(--shadow);
-      backdrop-filter: blur(18px);
+      grid-template-columns: 72px 240px minmax(0,1fr) 268px;
+      min-width:0;
     }
 
     .servers{
-      border-radius:var(--radius);
-      padding:12px 8px;
+      background:var(--panel-2);
+      border-right:1px solid rgba(255,255,255,.04);
+      padding:12px 0;
       display:flex;
       flex-direction:column;
       gap:10px;
       align-items:center;
-      overflow:auto;
+      overflow-y:auto;
     }
     .server-btn{
-      width:58px;height:58px;
+      width:48px;
+      height:48px;
       border:none;
-      border-radius:18px;
+      border-radius:16px;
       cursor:pointer;
-      background:linear-gradient(180deg, #1a2448, #0f1630);
+      background:#383a40;
       color:var(--text);
-      border:1px solid rgba(255,255,255,.05);
       font-weight:800;
       transition:.15s ease;
+      box-shadow:none;
       flex:0 0 auto;
     }
-    .server-btn:hover{transform:translateY(-1px); border-color:rgba(123,140,255,.35)}
+    .server-btn:hover{background:#4752c4; transform:translateY(-1px)}
     .server-btn.active{
-      background:linear-gradient(180deg, #7b8cff, #5361ff);
-      box-shadow:0 14px 32px rgba(123,140,255,.22);
+      background:var(--accent);
+      border-radius:14px;
     }
 
     .sidebar{
-      border-radius:var(--radius);
-      overflow:hidden;
+      background:var(--panel);
+      border-right:1px solid rgba(255,255,255,.04);
       display:flex;
       flex-direction:column;
       min-width:0;
+      overflow:hidden;
     }
     .side-top{
-      padding:18px;
-      border-bottom:1px solid var(--line);
-      background:linear-gradient(180deg, rgba(255,255,255,.01), rgba(255,255,255,.02));
+      padding:16px 14px 12px;
+      border-bottom:1px solid rgba(255,255,255,.04);
+      flex:0 0 auto;
     }
     .brand{
       display:flex;
-      align-items:flex-start;
+      align-items:center;
       justify-content:space-between;
-      gap:12px;
+      gap:10px;
     }
     .brand h1{
       margin:0;
-      font-size:24px;
-      line-height:1;
+      font-size:16px;
+      line-height:1.2;
+      letter-spacing:.2px;
     }
     .brand small{
       display:block;
-      margin-top:5px;
+      margin-top:3px;
       color:var(--muted);
       font-size:12px;
     }
     .pill{
+      margin-top:10px;
       display:inline-flex;
       align-items:center;
       gap:8px;
-      margin-top:12px;
-      padding:8px 10px;
+      padding:6px 10px;
       border-radius:999px;
-      border:1px solid rgba(255,255,255,.08);
-      background:rgba(255,255,255,.03);
-      color:#d8e0ff;
+      background:rgba(255,255,255,.04);
+      color:var(--muted);
       font-size:12px;
-      width:fit-content;
+      max-width:100%;
     }
     .section{
-      padding:14px;
+      padding:10px 8px 8px;
+      overflow-y:auto;
+      min-height:0;
+      flex:1 1 auto;
     }
     .section-title{
-      margin:0 0 10px;
-      color:#b7c4ea;
-      font-size:12px;
+      margin:6px 8px 10px;
+      color:#969aa3;
+      font-size:11px;
+      font-weight:700;
       text-transform:uppercase;
-      letter-spacing:.14em;
+      letter-spacing:.09em;
     }
     .channel{
       width:100%;
       border:none;
-      border-radius:14px;
-      padding:12px;
-      margin-bottom:6px;
+      border-radius:8px;
+      padding:9px 10px;
+      margin-bottom:2px;
       cursor:pointer;
       background:transparent;
       color:var(--text);
@@ -469,415 +469,402 @@ def page_html() -> str:
       justify-content:space-between;
       gap:10px;
       text-align:left;
-      transition:.14s ease;
+      transition:.12s ease;
     }
     .channel:hover{background:rgba(255,255,255,.04)}
-    .channel.active{
-      background:rgba(123,140,255,.15);
-      outline:1px solid rgba(123,140,255,.27);
-    }
+    .channel.active{background:rgba(255,255,255,.08)}
     .channel .meta{
       display:flex;
       flex-direction:column;
       min-width:0;
     }
-    .channel .meta strong{font-size:14px}
+    .channel .meta strong{
+      font-size:15px;
+      line-height:1.2;
+    }
     .channel .meta span{
       color:var(--muted);
       font-size:12px;
       overflow:hidden;
       text-overflow:ellipsis;
       white-space:nowrap;
-      max-width:190px;
+      max-width:165px;
     }
     .badge{
       font-size:11px;
-      padding:3px 8px;
+      padding:3px 7px;
       border-radius:999px;
-      background:rgba(123,140,255,.14);
-      color:#dbe2ff;
-      border:1px solid rgba(123,140,255,.18);
+      background:rgba(255,255,255,.06);
+      color:#d5d8de;
       flex:0 0 auto;
-    }
-    .footer-note{
-      margin-top:auto;
-      padding:14px 16px;
-      border-top:1px solid var(--line);
-      color:var(--muted);
-      font-size:12px;
-      line-height:1.6;
-    }
-    .kbd{
-      display:inline-flex;
-      align-items:center;
-      justify-content:center;
-      min-width:24px;
-      padding:2px 6px;
-      border-radius:6px;
-      border:1px solid rgba(255,255,255,.08);
-      background:rgba(255,255,255,.04);
-      color:#dbe3ff;
-      font-size:11px;
     }
 
     .main{
-      border-radius:var(--radius);
-      overflow:hidden;
+      min-width:0;
       display:flex;
       flex-direction:column;
-      min-width:0;
-      background:var(--panel2);
+      background:var(--bg);
+      overflow:hidden;
     }
+
     .main-top{
-      position:sticky;
-      top:0;
-      z-index:10;
-      padding:18px 20px;
-      border-bottom:1px solid var(--line);
+      flex:0 0 auto;
+      height:48px;
       display:flex;
-      align-items:flex-start;
+      align-items:center;
       justify-content:space-between;
-      gap:14px;
-      background:rgba(17, 26, 51, .98);
-      backdrop-filter: blur(14px);
+      padding:0 16px;
+      border-bottom:1px solid rgba(255,255,255,.05);
+      background:rgba(49,51,56,.92);
+      backdrop-filter: blur(10px);
+      z-index:3;
+    }
+    .titleblock{
+      display:flex;
+      align-items:center;
+      gap:12px;
+      min-width:0;
     }
     .titleblock h2{
       margin:0;
-      font-size:24px;
+      font-size:15px;
+      line-height:1;
+      white-space:nowrap;
     }
     .titleblock p{
-      margin:5px 0 0;
+      margin:0;
       color:var(--muted);
-      font-size:13px;
+      font-size:12px;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      max-width:42vw;
     }
     .conn{
       display:flex;
       align-items:center;
-      gap:10px;
+      gap:8px;
       color:var(--muted);
-      font-size:13px;
-      white-space:nowrap;
+      font-size:12px;
+      flex:0 0 auto;
     }
     .dot{
-      width:10px;height:10px;border-radius:999px;background:var(--accent2);
-      box-shadow:0 0 0 4px rgba(102,239,192,.12);
+      width:10px;height:10px;border-radius:999px;background:var(--accent-2);
+      box-shadow:0 0 0 4px rgba(59,165,93,.10);
+    }
+
+    .meta-row{
+      flex:0 0 auto;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      padding:12px 16px;
+      border-bottom:1px solid rgba(255,255,255,.05);
+      background:#313338;
     }
     .stats{
       display:flex;
       gap:10px;
       flex-wrap:wrap;
-      margin-top:14px;
+      min-width:0;
     }
     .stat{
-      border:1px solid rgba(255,255,255,.08);
-      background:rgba(255,255,255,.03);
-      border-radius:16px;
-      padding:12px 14px;
-      min-width:140px;
-    }
-    .stat b{
-      display:block;
-      font-size:19px;
-      margin-bottom:2px;
-    }
-    .stat span{
+      padding:7px 10px;
+      border-radius:999px;
+      background:rgba(255,255,255,.04);
       color:var(--muted);
       font-size:12px;
-    }
-
-    .topbar-tools{
-      display:flex;
-      gap:10px;
-      flex-wrap:wrap;
-      justify-content:flex-end;
-      align-items:center;
+      white-space:nowrap;
     }
     .search{
-      width:min(360px, 52vw);
-      padding:12px 14px;
-      border-radius:14px;
-      border:1px solid rgba(255,255,255,.08);
-      background:#08111f;
-      color:var(--text);
-      outline:none;
-    }
-    .toolbtn{
+      width:min(360px, 42vw);
+      padding:9px 12px;
+      border-radius:8px;
       border:none;
-      background:rgba(255,255,255,.06);
+      outline:none;
+      background:#1e1f22;
       color:var(--text);
-      border:1px solid rgba(255,255,255,.06);
-      padding:12px 14px;
-      border-radius:14px;
-      cursor:pointer;
     }
-    .toolbtn:hover{background:rgba(255,255,255,.09)}
 
     .typing{
-      min-height:22px;
-      color:#c7d2ff;
+      flex:0 0 auto;
+      min-height:18px;
+      padding:8px 16px 0;
+      color:#b9bec7;
       font-size:12px;
-      padding:0 22px 8px;
     }
 
     .messages{
-      flex:1;
-      overflow:auto;
-      padding:24px;
-      display:flex;
-      flex-direction:column;
-      gap:14px;
-      scroll-behavior:smooth;
+      flex:1 1 auto;
+      min-height:0;
+      overflow-y:auto;
+      padding:10px 0 0;
     }
+
+    .day-sep{
+      display:flex;
+      align-items:center;
+      gap:12px;
+      padding:10px 16px;
+      color:#9da3ad;
+      font-size:12px;
+      text-transform:uppercase;
+      letter-spacing:.08em;
+    }
+    .day-sep::before,.day-sep::after{
+      content:"";
+      height:1px;
+      background:rgba(255,255,255,.08);
+      flex:1;
+    }
+
     .msg{
       display:grid;
-      grid-template-columns:52px minmax(0,1fr);
-      gap:14px;
-      padding:18px;
-      border-radius:20px;
-      border:1px solid rgba(255,255,255,.06);
-      background:rgba(255,255,255,.025);
+      grid-template-columns: 42px minmax(0,1fr);
+      gap:12px;
+      padding:6px 16px 6px 16px;
+      position:relative;
     }
-    .msg:hover{background:rgba(255,255,255,.032)}
+    .msg:hover{
+      background:rgba(255,255,255,.02);
+    }
     .avatar{
-      width:52px;height:52px;border-radius:18px;
+      width:40px;
+      height:40px;
+      border-radius:50%;
+      background:var(--accent);
+      color:#fff;
       display:grid;
       place-items:center;
-      background:linear-gradient(180deg, #7b8cff, #5361ff);
-      color:#fff;
       font-weight:800;
+      font-size:15px;
+      margin-top:3px;
       flex:0 0 auto;
-      box-shadow:0 10px 20px rgba(123,140,255,.16);
     }
-    .head{
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:10px;
-      margin-bottom:8px;
-    }
-    .name{
-      display:flex;
-      align-items:center;
-      gap:8px;
-      font-weight:700;
+    .content{
       min-width:0;
     }
-    .name span:first-child{
-      overflow:hidden;
-      text-overflow:ellipsis;
-      white-space:nowrap;
+    .header{
+      display:flex;
+      align-items:baseline;
+      gap:8px;
+      min-width:0;
+      flex-wrap:wrap;
     }
-    .time{color:var(--muted);font-size:12px;flex:0 0 auto}
+    .name{
+      font-weight:700;
+      font-size:15px;
+      color:#fff;
+    }
+    .time{
+      color:#8e939d;
+      font-size:11px;
+    }
     .text{
+      margin-top:2px;
       white-space:pre-wrap;
       word-break:break-word;
-      line-height:1.7;
-      color:#eef2ff;
+      line-height:1.5;
       font-size:15px;
-    }
-    .system{
-      border-style:dashed;
-      background:rgba(123,140,255,.07);
+      color:#dbdee1;
     }
     .replybox{
-      margin-bottom:10px;
-      padding:10px 12px;
-      border-radius:14px;
-      border-left:3px solid rgba(123,140,255,.75);
-      background:rgba(123,140,255,.08);
-      color:#d9e2ff;
+      margin-top:6px;
+      padding:8px 10px;
+      border-left:3px solid rgba(88,101,242,.95);
+      background:rgba(88,101,242,.09);
+      color:#dfe4ff;
+      border-radius:8px;
       font-size:12px;
     }
-    .msg-actions{
+    .actions{
       display:flex;
-      gap:8px;
+      gap:6px;
       flex-wrap:wrap;
-      margin-top:12px;
+      margin-top:8px;
+      opacity:.88;
     }
     .chipbtn{
       border:none;
-      border-radius:999px;
-      padding:7px 10px;
+      background:#4f545c;
+      color:#fff;
+      border-radius:6px;
+      padding:5px 8px;
       cursor:pointer;
       font-size:12px;
-      background:rgba(255,255,255,.05);
-      color:#e9eeff;
-      border:1px solid rgba(255,255,255,.06);
+      line-height:1;
     }
-    .chipbtn:hover{background:rgba(255,255,255,.09)}
+    .chipbtn:hover{background:#5b6068}
     .chipbtn.active{
-      background:rgba(123,140,255,.16);
-      border-color:rgba(123,140,255,.22);
+      background:rgba(88,101,242,.95);
+    }
+    .system{
+      color:#b9bec7;
+    }
+    .system .avatar{
+      background:#4e5058;
+    }
+    .system .text{
+      color:#b9bec7;
+      font-style:italic;
     }
 
     .composer{
-      padding:16px 18px 18px;
-      border-top:1px solid var(--line);
-      background:linear-gradient(180deg, rgba(255,255,255,.01), rgba(255,255,255,.03));
+      flex:0 0 auto;
+      padding:16px;
+      background:var(--bg);
     }
     .composer-wrap{
       display:flex;
-      gap:12px;
-      align-items:flex-end;
-      padding:16px;
-      border-radius:22px;
-      background:#08111f;
-      border:1px solid rgba(255,255,255,.06);
+      align-items:flex-start;
+      gap:10px;
+      padding:12px 14px;
+      border-radius:10px;
+      background:#383a40;
+      border:1px solid rgba(255,255,255,.04);
     }
     .composer textarea{
       flex:1;
+      min-height:44px;
+      max-height:140px;
+      height:44px;
       resize:none;
-      min-height:72px;
-      max-height:220px;
-      background:transparent;
-      color:var(--text);
+      overflow-y:auto;
       border:none;
       outline:none;
-      line-height:1.65;
-      padding:12px 10px;
+      background:transparent;
+      color:var(--text);
+      line-height:1.5;
+      padding:10px 2px;
       font-size:15px;
     }
     .send{
       border:none;
-      background:linear-gradient(180deg, #7b8cff, #5361ff);
+      background:var(--accent);
       color:#fff;
-      padding:14px 18px;
-      border-radius:14px;
+      padding:10px 14px;
+      border-radius:8px;
       cursor:pointer;
       font-weight:700;
-      box-shadow:0 14px 30px rgba(123,140,255,.20);
-      min-width:98px;
+      flex:0 0 auto;
     }
-    .send:hover{filter:brightness(1.04)}
 
-    .tools{
-      border-radius:var(--radius);
+    .members{
+      background:var(--panel);
+      border-left:1px solid rgba(255,255,255,.04);
+      display:flex;
+      flex-direction:column;
+      min-width:0;
       overflow:hidden;
-      display:flex;
-      flex-direction:column;
-      min-width:0;
     }
-    .panel{
-      padding:16px;
-      border-bottom:1px solid var(--line);
+    .members-top{
+      padding:14px 14px 12px;
+      border-bottom:1px solid rgba(255,255,255,.04);
+      flex:0 0 auto;
     }
-    .panel h3{
-      margin:0 0 10px;
-      font-size:14px;
-    }
-    .panel p, .panel li{
-      color:var(--muted);
-      font-size:13px;
-      line-height:1.6;
-    }
-    .input{
-      width:100%;
-      margin-top:10px;
-      padding:12px 14px;
-      border-radius:14px;
-      border:1px solid rgba(255,255,255,.08);
-      background:#08111f;
-      color:var(--text);
-      outline:none;
-    }
-    .list{
-      display:flex;
-      flex-direction:column;
-      gap:10px;
+    .members-top h3{
       margin:0;
-      padding:0;
-      list-style:none;
+      font-size:12px;
+      text-transform:uppercase;
+      letter-spacing:.09em;
+      color:#969aa3;
     }
-    .user{
-      display:flex;
-      align-items:flex-start;
-      justify-content:space-between;
-      gap:10px;
-      padding:12px;
-      border-radius:16px;
-      background:rgba(255,255,255,.03);
-      border:1px solid rgba(255,255,255,.05);
-    }
-    .user-main{
-      min-width:0;
+    .memberlist{
+      padding:8px;
+      overflow-y:auto;
+      min-height:0;
       flex:1;
     }
-    .user strong{
-      font-size:13px;
+    .member{
       display:flex;
       align-items:center;
-      gap:6px;
-      margin-bottom:2px;
-    }
-    .user span{
-      font-size:12px;
-      color:var(--muted);
-    }
-    .mini{
-      border:none;
-      border-radius:10px;
-      padding:7px 9px;
-      cursor:pointer;
-      font-size:11px;
-      background:rgba(255,255,255,.06);
-      color:#e9eeff;
-      border:1px solid rgba(255,255,255,.06);
-    }
-    .mini:hover{background:rgba(255,255,255,.09)}
-    .tiny{
-      color:var(--muted);
-      font-size:12px;
-      line-height:1.6;
-      padding:14px 16px;
-    }
-    .updates{
-      display:flex;
-      flex-direction:column;
+      justify-content:space-between;
       gap:10px;
+      padding:9px 10px;
+      border-radius:8px;
+      color:var(--text);
     }
-    .update{
-      padding:12px;
-      border-radius:14px;
-      border:1px solid rgba(255,255,255,.06);
-      background:rgba(255,255,255,.025);
+    .member:hover{background:rgba(255,255,255,.04)}
+    .member .left{
+      min-width:0;
     }
-    .update b{
+    .member .left strong{
       display:block;
-      margin-bottom:4px;
-      font-size:13px;
+      font-size:14px;
+      line-height:1.2;
+    }
+    .member .left span{
+      display:block;
+      margin-top:2px;
+      font-size:12px;
+      color:var(--muted);
+    }
+    .member .dot2{
+      width:8px;height:8px;border-radius:999px;background:var(--accent-2);flex:0 0 auto;
     }
 
-    @media (max-width: 1280px){
-      .app{grid-template-columns: 92px 270px minmax(0,1fr);}
-      .tools{display:none}
+    .pinsbar{
+      display:flex;
+      gap:8px;
+      overflow-x:auto;
+      padding:0 16px 10px;
+      min-height:0;
     }
-    @media (max-width: 900px){
+    .pinpill{
+      flex:0 0 auto;
+      max-width:280px;
+      padding:7px 10px;
+      border-radius:999px;
+      background:rgba(255,255,255,.05);
+      color:#d7dae0;
+      font-size:12px;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+
+    @media (max-width: 1100px){
+      .app{grid-template-columns:72px 240px minmax(0,1fr);}
+      .members{display:none}
+      .search{width:40vw}
+    }
+    @media (max-width: 820px){
+      body{overflow:auto}
       .app{
+        height:auto;
+        min-height:100vh;
         grid-template-columns:1fr;
-        padding:12px;
+      }
+      .servers,.sidebar,.main,.members{
+        border-right:none;
+        border-left:none;
       }
       .servers{
         flex-direction:row;
         justify-content:flex-start;
-        overflow:auto;
+        padding:10px;
+        overflow-x:auto;
+        overflow-y:hidden;
       }
-      .main{min-height:74vh}
-      .tools{display:flex}
+      .sidebar{min-height:220px}
+      .members{display:flex;min-height:220px}
       .search{width:100%}
-      .topbar-tools{justify-content:flex-start}
+      .meta-row{flex-direction:column; align-items:stretch}
+      .titleblock p{max-width:100%}
     }
   </style>
 </head>
 <body>
   <div class="app">
-    <aside class="servers glass" id="servers"></aside>
+    <aside class="servers" id="servers"></aside>
 
-    <aside class="sidebar glass">
+    <aside class="sidebar">
       <div class="side-top">
         <div class="brand">
           <div>
             <h1>LinkUp</h1>
-            <small>clean, fast, and less cramped</small>
+            <small>clean chat, not cramped</small>
           </div>
           <div class="badge">LIVE</div>
         </div>
@@ -885,87 +872,47 @@ def page_html() -> str:
       </div>
 
       <div class="section">
-        <h3 class="section-title">Channels</h3>
+        <div class="section-title">Channels</div>
         <div id="channels"></div>
-      </div>
-
-      <div class="footer-note">
-        Press <span class="kbd">Enter</span> to send, <span class="kbd">Shift</span> + <span class="kbd">Enter</span> for a new line.
       </div>
     </aside>
 
-    <main class="main glass">
+    <main class="main">
       <div class="main-top">
         <div class="titleblock">
           <h2 id="channelTitle"># general</h2>
-          <p id="channelDescription">A large room for real-time chat, with live presence and reconnects.</p>
-          <div class="stats">
-            <div class="stat">
-              <b id="statMessages">0</b>
-              <span>messages in room</span>
-            </div>
-            <div class="stat">
-              <b id="statUsers">0</b>
-              <span>online now</span>
-            </div>
-            <div class="stat">
-              <b id="statPins">0</b>
-              <span>pinned messages</span>
-            </div>
-            <div class="stat">
-              <b id="statState">idle</b>
-              <span>connection state</span>
-            </div>
-          </div>
+          <p id="channelDescription">A big, readable room for real-time chat.</p>
         </div>
-        <div class="topbar-tools">
-          <input class="search" id="searchInput" placeholder="Search messages in this room..." />
-          <button class="toolbtn" id="jumpPinsBtn">Pins</button>
-          <div class="conn"><span class="dot"></span><span id="connState">connecting...</span></div>
+        <div class="conn"><span class="dot"></span><span id="connState">connecting...</span></div>
+      </div>
+
+      <div class="meta-row">
+        <div class="stats">
+          <div class="stat"><span id="statUsers">0</span> online</div>
+          <div class="stat"><span id="statMessages">0</span> messages</div>
+          <div class="stat"><span id="statPins">0</span> pinned</div>
+          <div class="stat"><span id="statState">idle</span></div>
         </div>
+        <input class="search" id="searchInput" placeholder="Search this room..." />
       </div>
 
       <div class="typing" id="typingLine"></div>
+      <div class="pinsbar" id="pinsbar"></div>
       <div class="messages" id="messages"></div>
 
       <div class="composer">
         <div class="composer-wrap">
-          <textarea id="messageInput" placeholder="Write a message to LinkUp..."></textarea>
+          <textarea id="messageInput" placeholder="Message LinkUp..."></textarea>
           <button class="send" id="sendBtn">Send</button>
         </div>
       </div>
     </main>
 
-    <aside class="tools glass">
-      <div class="panel">
-        <h3>Your profile</h3>
-        <p>Set your display name. Your browser keeps it saved.</p>
-        <input class="input" id="nameInput" maxlength="24" placeholder="Your name" />
+    <aside class="members">
+      <div class="members-top">
+        <h3>Online</h3>
       </div>
-
-      <div class="panel">
-        <h3>Online now</h3>
-        <ul class="list" id="members"></ul>
-      </div>
-
-      <div class="panel">
-        <h3>Pinned messages</h3>
-        <ul class="list" id="pins"></ul>
-      </div>
-
-      <div class="panel">
-        <h3>What’s new</h3>
-        <div class="updates">
-          <div class="update"><b>No admin gimmicks</b><span>Nothing is auto-promoted, no first-user power abuse.</span></div>
-          <div class="update"><b>Better UX</b><span>More space, bigger message flow, less visual clutter.</span></div>
-          <div class="update"><b>Search + pins</b><span>Find messages fast and keep important ones up top.</span></div>
-          <div class="update"><b>Replies + reactions</b><span>Talk like a real modern chat app.</span></div>
-        </div>
-      </div>
-
-      <div class="tiny">
-        This is now built like a product shell, not a tiny demo. Add auth + database next and it becomes persistent.
-      </div>
+      <div class="memberlist" id="members"></div>
     </aside>
   </div>
 
@@ -1001,6 +948,8 @@ def page_html() -> str:
     ]
   };
 
+  const emojiChoices = ["👍", "🔥", "😂", "👀", "💯", "❤️"];
+
   const els = {
     servers: document.getElementById("servers"),
     channels: document.getElementById("channels"),
@@ -1011,7 +960,6 @@ def page_html() -> str:
     messageInput: document.getElementById("messageInput"),
     sendBtn: document.getElementById("sendBtn"),
     roomLabel: document.getElementById("roomLabel"),
-    nameInput: document.getElementById("nameInput"),
     members: document.getElementById("members"),
     typingLine: document.getElementById("typingLine"),
     statMessages: document.getElementById("statMessages"),
@@ -1019,14 +967,12 @@ def page_html() -> str:
     statPins: document.getElementById("statPins"),
     statState: document.getElementById("statState"),
     searchInput: document.getElementById("searchInput"),
-    pins: document.getElementById("pins"),
-    jumpPinsBtn: document.getElementById("jumpPinsBtn"),
+    pinsbar: document.getElementById("pinsbar"),
   };
 
   const savedName = localStorage.getItem("linkup_name") || "You";
   const localClientId = localStorage.getItem("linkup_client_id") || ("cli_" + Math.random().toString(36).slice(2, 10));
   localStorage.setItem("linkup_client_id", localClientId);
-  els.nameInput.value = savedName;
 
   let displayName = savedName;
   let selectedServer = localStorage.getItem("linkup_server") || "home";
@@ -1038,42 +984,40 @@ def page_html() -> str:
   let handshakeTimer = null;
   let retryCount = 0;
   let typingTimeout = null;
-  let activeReplyTo = null;
+  let replyTo = null;
 
   const roomMessages = new Map();
   const roomSeen = new Map();
   const roomPresence = new Map();
   const roomPins = new Map();
-  const pinnedIds = new Set();
+  const reactionMap = new Map();
 
-  const systemSeeds = {
+  const seeds = {
     general: [
-      "Welcome to LinkUp. This room is live.",
-      "Search, pin, reply, and react are enabled.",
-      "No fake admin junk. Just chat features."
+      "Welcome to LinkUp.",
+      "This UI is now flatter and easier to read.",
+      "Scroll the message area and the composer stays put."
     ],
-    announcements: ["Ship updates here.", "Use this room for changelogs."],
-    showcase: ["Drop your best work here.", "Show your builds and screenshots."],
+    announcements: ["Ship updates here."],
+    showcase: ["Drop your best work here."],
     frontend: ["UI, motion, and layout talk."],
     backend: ["FastAPI, WebSockets, and database design."],
-    bugs: ["Log a bug, then squash it."],
+    bugs: ["Log bugs and squash them."],
     lobby: ["Find your squad."],
     clips: ["Funny moments belong here."],
-    meta: ["Discuss game balance and tactics."],
+    meta: ["Discuss builds and strategy."],
     math: ["Study mode online."],
     coding: ["Code and conquer."],
     focus: ["Deep work zone."]
   };
 
-  const emojiChoices = ["👍", "🔥", "😂", "👀", "💯", "❤️"];
-
   function escapeHtml(str) {
     return String(str).replace(/[&<>"']/g, s => ({
-      "&":"&amp;",
-      "<":"&lt;",
-      ">":"&gt;",
-      "\"":"&quot;",
-      "'":"&#39;"
+      "&": "&amp;",
+      "<": "&lt;",
+      ">": "&gt;",
+      "\"": "&quot;",
+      "'": "&#39;"
     }[s]));
   }
 
@@ -1092,14 +1036,14 @@ def page_html() -> str:
 
   function setStatus(text, connected = false) {
     els.connState.textContent = text;
-    els.statState.textContent = text.toLowerCase().slice(0, 10);
-    els.connState.style.color = connected ? "#d7ffe9" : "";
+    els.statState.textContent = text.toLowerCase().slice(0, 8);
+    els.connState.style.color = connected ? "#dcffe9" : "";
   }
 
   function ensureRoom(room) {
     if (!roomMessages.has(room)) {
       const ch = room.split(":")[1] || "general";
-      const seed = (systemSeeds[ch] || ["Room loaded."]).map((text, idx) => ({
+      const seedMessages = (seeds[ch] || ["Room loaded."]).map((text, idx) => ({
         msg_id: `seed-${room}-${idx}`,
         kind: "system",
         name: "System",
@@ -1107,11 +1051,22 @@ def page_html() -> str:
         time: Date.now() - ((idx + 1) * 60000),
         room
       }));
-      roomMessages.set(room, seed);
-      roomSeen.set(room, new Set(seed.map(m => m.msg_id)));
+      roomMessages.set(room, seedMessages);
+      roomSeen.set(room, new Set(seedMessages.map(m => m.msg_id)));
       roomPresence.set(room, []);
       roomPins.set(room, []);
+      reactionMap.set(room, new Map());
     }
+  }
+
+  function currentUsers() {
+    ensureRoom(roomId());
+    return roomPresence.get(roomId()) || [];
+  }
+
+  function currentPins() {
+    ensureRoom(roomId());
+    return roomPins.get(roomId()) || [];
   }
 
   function seenSet(room) {
@@ -1119,149 +1074,9 @@ def page_html() -> str:
     return roomSeen.get(room);
   }
 
-  function getRoomMessages(room) {
-    ensureRoom(room);
-    return roomMessages.get(room);
-  }
-
-  function getPresence(room) {
-    ensureRoom(room);
-    return roomPresence.get(room) || [];
-  }
-
-  function getPins(room) {
-    ensureRoom(room);
-    return roomPins.get(room) || [];
-  }
-
-  function myState(room) {
-    const users = getPresence(room);
-    return users.find(u => u.client_id === localClientId) || null;
-  }
-
-  function canPin() {
-    return true;
-  }
-
-  function renderReactionBadges(reactions = {}) {
-    const keys = Object.keys(reactions || {});
-    if (!keys.length) return "";
-    return keys.map(e => `<button class="chipbtn" data-emoji="${escapeHtml(e)}">${escapeHtml(e)} ${reactions[e]}</button>`).join("");
-  }
-
-  function renderMessageHtml(m) {
-    if (m.kind === "system") {
-      return `
-        <div class="msg system" data-id="${escapeHtml(m.msg_id)}">
-          <div class="avatar">!</div>
-          <div>
-            <div class="head">
-              <div class="name"><span>System</span><span class="badge">notice</span></div>
-              <span class="time">${fmtTime(m.time)}</span>
-            </div>
-            <div class="text">${escapeHtml(m.text)}</div>
-          </div>
-        </div>`;
-    }
-
-    const initial = (m.name || "?").trim().slice(0, 1).toUpperCase();
-    const isSelf = m.client_id === localClientId;
-    const reactions = m.reactions || {};
-    const reply = m.reply_preview;
-
-    return `
-      <div class="msg" data-id="${escapeHtml(m.msg_id)}">
-        <div class="avatar">${escapeHtml(initial)}</div>
-        <div>
-          <div class="head">
-            <div class="name">
-              <span>${escapeHtml(m.name || "Guest")}</span>
-              <span class="badge">${isSelf ? "you" : "online"}</span>
-            </div>
-            <span class="time">${fmtTime(m.time)}</span>
-          </div>
-          ${reply ? `
-            <div class="replybox">
-              Replying to <b>${escapeHtml(reply.name || "Guest")}</b><br/>
-              ${escapeHtml((reply.text || "").slice(0, 120))}
-            </div>
-          ` : ""}
-          <div class="text">${escapeHtml(m.text || "")}</div>
-          <div class="msg-actions">
-            <button class="chipbtn" data-act="reply" data-id="${escapeHtml(m.msg_id)}">Reply</button>
-            <button class="chipbtn" data-act="pin" data-id="${escapeHtml(m.msg_id)}">${pinnedIds.has(m.msg_id) ? "Unpin" : "Pin"}</button>
-            <button class="chipbtn" data-act="react" data-id="${escapeHtml(m.msg_id)}">React</button>
-            ${Object.keys(reactions).length ? renderReactionBadges(reactions) : ""}
-          </div>
-        </div>
-      </div>`;
-  }
-
-  function renderMessages(room) {
-    const query = (els.searchInput.value || "").trim().toLowerCase();
-    const msgs = getRoomMessages(room).filter(m => {
-      if (m.kind === "system") return true;
-      if (!query) return true;
-      return String(m.text || "").toLowerCase().includes(query) || String(m.name || "").toLowerCase().includes(query);
-    });
-
-    els.messages.innerHTML = msgs.map(renderMessageHtml).join("");
-    els.statMessages.textContent = String(getRoomMessages(room).filter(m => m.kind !== "system").length);
-    els.messages.scrollTop = els.messages.scrollHeight;
-
-    bindMessageActions();
-  }
-
-  function updatePins(room) {
-    const pins = getPins(room);
-    els.pins.innerHTML = pins.length
-      ? pins.slice().reverse().map(p => `
-          <li class="user">
-            <div class="user-main">
-              <strong>${escapeHtml(p.name || "Guest")}</strong>
-              <span>${escapeHtml((p.text || "").slice(0, 70))}</span>
-            </div>
-            <button class="mini" data-jump="${escapeHtml(p.msg_id)}">Jump</button>
-          </li>
-        `).join("")
-      : `<li class="user"><div class="user-main"><strong>No pins yet</strong><span>Pin important messages so they stay visible.</span></div></li>`;
-
-    els.statPins.textContent = String(pins.length);
-
-    els.pins.querySelectorAll("button[data-jump]").forEach(btn => {
-      btn.onclick = () => {
-        const id = btn.dataset.jump;
-        const node = els.messages.querySelector(`[data-id="${CSS.escape(id)}"]`);
-        if (node) {
-          node.scrollIntoView({ behavior: "smooth", block: "center" });
-          node.style.outline = "1px solid rgba(123,140,255,.42)";
-          setTimeout(() => { node.style.outline = ""; }, 1200);
-        }
-      };
-    });
-  }
-
-  function addMessage(room, msg, renderNow = true) {
-    ensureRoom(room);
-
-    if (!msg.msg_id) {
-      msg.msg_id = "msg_" + Math.random().toString(36).slice(2, 14);
-    }
-
-    const seen = seenSet(room);
-    if (seen.has(msg.msg_id)) return;
-    seen.add(msg.msg_id);
-
-    msg.reactions = msg.reactions || {};
-    const list = roomMessages.get(room);
-    list.push(msg);
-
-    if (room === roomId() && renderNow) {
-      els.messages.insertAdjacentHTML("beforeend", renderMessageHtml(msg));
-      els.messages.scrollTop = els.messages.scrollHeight;
-      els.statMessages.textContent = String(list.filter(m => m.kind !== "system").length);
-      bindMessageActions();
-    }
+  function roomList() {
+    ensureRoom(roomId());
+    return roomMessages.get(roomId());
   }
 
   function renderServers() {
@@ -1273,14 +1088,12 @@ def page_html() -> str:
 
     els.servers.querySelectorAll("button").forEach(btn => {
       btn.onclick = () => {
-        const nextServer = btn.dataset.server;
-        if (nextServer === selectedServer) return;
-        selectedServer = nextServer;
+        selectedServer = btn.dataset.server;
         selectedChannel = channelsByServer[selectedServer][0].id;
-        activeReplyTo = null;
+        replyTo = null;
         localStorage.setItem("linkup_server", selectedServer);
         localStorage.setItem("linkup_channel", selectedChannel);
-        renderAll();
+        renderShell();
         connectSocket(true);
       };
     });
@@ -1299,66 +1112,151 @@ def page_html() -> str:
 
     els.channels.querySelectorAll("button").forEach(btn => {
       btn.onclick = () => {
-        const nextChannel = btn.dataset.channel;
-        if (nextChannel === selectedChannel) return;
-        selectedChannel = nextChannel;
-        activeReplyTo = null;
+        selectedChannel = btn.dataset.channel;
+        replyTo = null;
         localStorage.setItem("linkup_channel", selectedChannel);
-        renderAll();
+        renderShell();
         connectSocket(true);
       };
     });
   }
 
-  function updateProfileBox() {
-    const me = myState(roomId());
-    const label = me ? `online • ${me.name}` : "offline in room";
-    document.getElementById("roomLabel").textContent = `#${selectedChannel}`;
-    els.statUsers.textContent = String(getPresence(roomId()).length);
-    document.getElementById("channelTitle").textContent = currentChannel()?.title || "# general";
-    document.getElementById("channelDescription").textContent = currentChannel()?.description || "A large room for real-time chat.";
+  function renderTop() {
+    const ch = currentChannel();
+    els.roomLabel.textContent = `#${selectedChannel}`;
+    els.channelTitle.textContent = ch ? ch.title : "# general";
+    els.channelDescription.textContent = ch ? ch.description : "A big, readable room for real-time chat.";
   }
 
   function renderMembers() {
-    const roomUsers = getPresence(roomId());
-    const me = myState(roomId());
+    const users = currentUsers();
+    els.statUsers.textContent = String(users.length);
 
-    document.getElementById("meName").textContent = displayName;
-    document.getElementById("meRoleLine").textContent = me ? "online now" : "connecting...";
-    document.getElementById("meRoleBadge").textContent = me ? "live" : "guest";
-
-    els.members.innerHTML = roomUsers.length
-      ? roomUsers.map(u => {
-          const isSelf = u.client_id === localClientId;
-          return `
-            <li class="user">
-              <div class="user-main">
-                <strong>${escapeHtml(u.name)} ${isSelf ? "• you" : ""}</strong>
-                <span>connected</span>
-              </div>
-              <span class="badge">online</span>
-            </li>
-          `;
-        }).join("")
-      : `<li class="user"><div class="user-main"><strong>No one else yet</strong><span>Be the first in this room.</span></div><span class="badge">0</span></li>`;
+    els.members.innerHTML = users.length ? users.map(u => `
+      <div class="member">
+        <div class="left">
+          <strong>${escapeHtml(u.name)}</strong>
+          <span>online</span>
+        </div>
+        <div class="dot2"></div>
+      </div>
+    `).join("") : `
+      <div class="member">
+        <div class="left">
+          <strong>No one else yet</strong>
+          <span>Be the first in this room.</span>
+        </div>
+      </div>
+    `;
   }
 
-  function setHeader() {
-    const ch = currentChannel();
-    els.channelTitle.textContent = ch ? ch.title : "# general";
-    els.channelDescription.textContent = ch ? ch.description : "A large room for real-time chat, with live presence and reconnects.";
-    els.roomLabel.textContent = `#${selectedChannel}`;
-    document.title = `LinkUp — ${ch ? ch.title : "# general"}`;
+  function renderPins() {
+    const pins = currentPins();
+    els.statPins.textContent = String(pins.length);
+    els.pinsbar.innerHTML = pins.length ? pins.slice().reverse().map(p => `
+      <div class="pinpill" data-pin="${escapeHtml(p.msg_id)}">${escapeHtml(p.name)}: ${escapeHtml((p.text || "").slice(0, 80))}</div>
+    `).join("") : `<div class="pinpill">No pins yet</div>`;
+
+    els.pinsbar.querySelectorAll("[data-pin]").forEach(node => {
+      node.onclick = () => {
+        const id = node.getAttribute("data-pin");
+        const target = els.messages.querySelector(`[data-id="${CSS.escape(id)}"]`);
+        if (target) target.scrollIntoView({ behavior: "smooth", block: "center" });
+      };
+    });
   }
 
-  function renderAll() {
+  function renderMessageHtml(m) {
+    const reactions = m.reactions || {};
+    const reactionKeys = Object.keys(reactions);
+    const isSelf = m.client_id === localClientId;
+    const initial = (m.name || "?").trim().slice(0, 1).toUpperCase();
+
+    if (m.kind === "system") {
+      return `
+        <div class="msg system" data-id="${escapeHtml(m.msg_id)}">
+          <div class="avatar">!</div>
+          <div class="content">
+            <div class="header">
+              <div class="name">System</div>
+              <div class="time">${fmtTime(m.time)}</div>
+            </div>
+            <div class="text">${escapeHtml(m.text)}</div>
+          </div>
+        </div>
+      `;
+    }
+
+    return `
+      <div class="msg" data-id="${escapeHtml(m.msg_id)}">
+        <div class="avatar">${escapeHtml(initial)}</div>
+        <div class="content">
+          <div class="header">
+            <div class="name">${escapeHtml(m.name || "Guest")} ${isSelf ? "<span class='badge'>you</span>" : ""}</div>
+            <div class="time">${fmtTime(m.time)}</div>
+          </div>
+          ${m.reply_preview ? `
+            <div class="replybox">
+              Replying to <b>${escapeHtml(m.reply_preview.name || "Guest")}</b><br/>
+              ${escapeHtml((m.reply_preview.text || "").slice(0, 120))}
+            </div>
+          ` : ""}
+          <div class="text">${escapeHtml(m.text || "")}</div>
+          <div class="actions">
+            <button class="chipbtn" data-action="reply" data-id="${escapeHtml(m.msg_id)}">Reply</button>
+            <button class="chipbtn" data-action="pin" data-id="${escapeHtml(m.msg_id)}">Pin</button>
+            <button class="chipbtn" data-action="react" data-id="${escapeHtml(m.msg_id)}">React</button>
+            ${reactionKeys.map(e => `<button class="chipbtn active">${escapeHtml(e)} ${reactions[e]}</button>`).join("")}
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  function applyFilter(room) {
+    const q = (els.searchInput.value || "").trim().toLowerCase();
+    return roomList(room).filter(m => {
+      if (m.kind === "system") return true;
+      if (!q) return true;
+      return String(m.text || "").toLowerCase().includes(q) || String(m.name || "").toLowerCase().includes(q);
+    });
+  }
+
+  function renderMessages() {
+    ensureRoom(roomId());
+    const msgs = applyFilter(roomId());
+    els.messages.innerHTML = msgs.map(renderMessageHtml).join("");
+    els.statMessages.textContent = String(roomList().filter(m => m.kind !== "system").length);
+    els.messages.scrollTop = els.messages.scrollHeight;
+    bindMessageActions();
+  }
+
+  function renderShell() {
     renderServers();
     renderChannels();
-    setHeader();
-    updateProfileBox();
+    renderTop();
     renderMembers();
-    updatePins(roomId());
-    renderMessages(roomId());
+    renderPins();
+    renderMessages();
+  }
+
+  function pushMessage(room, msg, renderNow = true) {
+    ensureRoom(room);
+    if (!msg.msg_id) msg.msg_id = "msg_" + Math.random().toString(36).slice(2, 12);
+
+    const seen = seenSet(room);
+    if (seen.has(msg.msg_id)) return;
+    seen.add(msg.msg_id);
+
+    msg.reactions = msg.reactions || {};
+    roomList().push(msg);
+
+    if (room === roomId() && renderNow) {
+      els.messages.insertAdjacentHTML("beforeend", renderMessageHtml(msg));
+      els.messages.scrollTop = els.messages.scrollHeight;
+      els.statMessages.textContent = String(roomList().filter(m => m.kind !== "system").length);
+      bindMessageActions();
+    }
   }
 
   function wsUrl(room) {
@@ -1392,7 +1290,7 @@ def page_html() -> str:
       if (!socket || socket.readyState !== WebSocket.OPEN) {
         setStatus(`reconnecting in ${Math.ceil(delay / 1000)}s`);
       }
-    }, 25);
+    }, 20);
   }
 
   function connectSocket(force = false) {
@@ -1402,7 +1300,7 @@ def page_html() -> str:
     let opened = false;
 
     if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
-      try { socket.close(1000, "switching-room"); } catch {}
+      try { socket.close(1000, "switch"); } catch {}
     }
 
     roomPresence.set(room, []);
@@ -1411,7 +1309,7 @@ def page_html() -> str:
 
     try {
       socket = new WebSocket(wsUrl(room));
-    } catch (err) {
+    } catch {
       setStatus("socket unavailable");
       scheduleReconnect(seq);
       return;
@@ -1447,11 +1345,7 @@ def page_html() -> str:
       if (seq !== connectionSeq) return;
 
       let data = null;
-      try {
-        data = JSON.parse(event.data);
-      } catch {
-        data = null;
-      }
+      try { data = JSON.parse(event.data); } catch { data = null; }
       if (!data) return;
 
       if (data.kind === "history") {
@@ -1459,24 +1353,21 @@ def page_html() -> str:
         const users = Array.isArray(data.users) ? data.users : [];
         const pins = Array.isArray(data.pins) ? data.pins : [];
 
-        const seen = new Set();
         roomMessages.set(room, []);
-        roomSeen.set(room, seen);
+        roomSeen.set(room, new Set());
         roomPresence.set(room, users);
         roomPins.set(room, pins);
-        pinnedIds.clear();
-        pins.forEach(p => pinnedIds.add(p.msg_id));
 
         history.forEach(m => {
           if (!m.msg_id) m.msg_id = "hist_" + Math.random().toString(36).slice(2, 12);
-          seen.add(m.msg_id);
+          seenSet(room).add(m.msg_id);
           if (!m.reactions) m.reactions = {};
           roomMessages.get(room).push(m);
         });
 
         renderMembers();
-        updatePins(room);
-        renderMessages(room);
+        renderPins();
+        renderMessages();
         return;
       }
 
@@ -1490,36 +1381,28 @@ def page_html() -> str:
         if (data.client_id && data.client_id !== localClientId) {
           els.typingLine.textContent = `${data.name || "Someone"} is typing...`;
           clearTimeout(typingTimeout);
-          typingTimeout = setTimeout(() => {
-            els.typingLine.textContent = "";
-          }, 1200);
+          typingTimeout = setTimeout(() => els.typingLine.textContent = "", 1200);
         }
         return;
       }
 
       if (data.kind === "system") {
-        addMessage(room, data, true);
+        pushMessage(room, data, true);
         return;
       }
 
       if (data.kind === "pin_update") {
-        const msgId = data.message?.msg_id;
-        if (data.action === "pinned" && msgId) pinnedIds.add(msgId);
-        if (data.action === "unpinned" && msgId) pinnedIds.delete(msgId);
-
-        const pins = Array.isArray(data.pins) ? data.pins : [];
-        roomPins.set(room, pins);
-        updatePins(room);
-        renderMessages(room);
+        roomPins.set(room, Array.isArray(data.pins) ? data.pins : []);
+        renderPins();
         return;
       }
 
       if (data.kind === "reaction_update") {
-        const list = roomMessages.get(room) || [];
+        const list = roomList();
         const target = list.find(m => m.msg_id === data.msg_id);
         if (target) {
           target.reactions = data.reactions || {};
-          renderMessages(room);
+          renderMessages();
         }
         return;
       }
@@ -1528,8 +1411,8 @@ def page_html() -> str:
         data.time = data.time || Date.now();
         data.client_id = data.client_id || "remote";
         data.msg_id = data.msg_id || `srv_${room}_${data.time}_${Math.random().toString(36).slice(2, 8)}`;
-        if (!data.reactions) data.reactions = {};
-        addMessage(room, data, true);
+        data.reactions = data.reactions || {};
+        pushMessage(room, data, true);
       }
     };
 
@@ -1542,12 +1425,7 @@ def page_html() -> str:
       if (seq !== connectionSeq) return;
       cleanupSocketTimers();
 
-      if (opened) {
-        setStatus("disconnected");
-      } else {
-        setStatus("offline");
-      }
-
+      setStatus(opened ? "disconnected" : "offline");
       scheduleReconnect(seq);
     };
   }
@@ -1576,101 +1454,80 @@ def page_html() -> str:
       room: roomId(),
       server: selectedServer,
       channel: selectedChannel,
-      reply_to: activeReplyTo,
+      reply_to: replyTo,
       time: Date.now()
     };
 
-    const replyNode = activeReplyTo ? roomMessages.get(roomId())?.find(m => m.msg_id === activeReplyTo) : null;
-    if (replyNode) {
-      payload.reply_preview = {
-        msg_id: replyNode.msg_id,
-        name: replyNode.name,
-        text: replyNode.text
-      };
+    if (replyTo) {
+      const original = roomList().find(m => m.msg_id === replyTo);
+      if (original) {
+        payload.reply_preview = {
+          msg_id: original.msg_id,
+          name: original.name,
+          text: original.text
+        };
+      }
     }
 
-    addMessage(roomId(), payload, true);
+    pushMessage(roomId(), payload, true);
 
     if (socket && socket.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify(payload));
     }
 
-    activeReplyTo = null;
+    replyTo = null;
+    els.messageInput.placeholder = "Message LinkUp...";
     els.messageInput.value = "";
-    els.messageInput.style.height = "72px";
     els.messageInput.focus();
   }
 
   function bindMessageActions() {
-    document.querySelectorAll(".msg-actions .chipbtn").forEach(btn => {
+    els.messages.querySelectorAll(".chipbtn[data-action]").forEach(btn => {
       btn.onclick = () => {
+        const action = btn.dataset.action;
+        const id = btn.dataset.id;
         const room = roomId();
-        const act = btn.dataset.act;
-        const msgId = btn.dataset.id;
 
-        if (act === "reply") {
-          activeReplyTo = msgId;
-          const node = roomMessages.get(room)?.find(m => m.msg_id === msgId);
-          if (node) {
-            els.messageInput.placeholder = `Replying to ${node.name}...`;
-            els.messageInput.focus();
-          }
+        if (action === "reply") {
+          replyTo = id;
+          const original = roomList().find(m => m.msg_id === id);
+          els.messageInput.placeholder = original ? `Replying to ${original.name}...` : "Replying...";
+          els.messageInput.focus();
           return;
         }
 
-        if (act === "pin") {
-          if (!canPin()) return;
-          if (socket && socket.readyState === WebSocket.OPEN) {
-            socket.send(JSON.stringify({
-              kind: "pin",
-              client_id: localClientId,
-              name: displayName,
-              room,
-              msg_id: msgId,
-              time: Date.now()
-            }));
-          }
+        if (action === "pin") {
+          if (!socket || socket.readyState !== WebSocket.OPEN) return;
+          socket.send(JSON.stringify({
+            kind: "pin",
+            client_id: localClientId,
+            name: displayName,
+            room,
+            msg_id: id,
+            time: Date.now()
+          }));
           return;
         }
 
-        if (act === "react") {
-          const emoji = prompt(`Pick a reaction: ${emojiChoices.join(" ")}`, "👍");
+        if (action === "react") {
+          const emoji = prompt(`Reaction: ${emojiChoices.join(" ")}`, "👍");
           if (!emoji) return;
-          if (socket && socket.readyState === WebSocket.OPEN) {
-            socket.send(JSON.stringify({
-              kind: "reaction",
-              client_id: localClientId,
-              name: displayName,
-              room,
-              msg_id: msgId,
-              emoji: emoji.trim().slice(0, 4),
-              time: Date.now()
-            }));
-          }
-          return;
+          if (!socket || socket.readyState !== WebSocket.OPEN) return;
+          socket.send(JSON.stringify({
+            kind: "reaction",
+            client_id: localClientId,
+            name: displayName,
+            room,
+            msg_id: id,
+            emoji: emoji.trim().slice(0, 4),
+            time: Date.now()
+          }));
         }
       };
     });
   }
 
-  els.nameInput.addEventListener("change", () => {
-    displayName = (els.nameInput.value || "You").trim().slice(0, 24) || "You";
-    localStorage.setItem("linkup_name", displayName);
-
-    if (socket && socket.readyState === WebSocket.OPEN) {
-      socket.send(JSON.stringify({
-        kind: "rename",
-        client_id: localClientId,
-        name: displayName,
-        room: roomId(),
-        time: Date.now()
-      }));
-    }
-
-    updateProfileBox();
-  });
-
-  els.sendBtn.onclick = sendMessage;
+  els.searchInput.addEventListener("input", renderMessages);
 
   els.messageInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
@@ -1680,19 +1537,10 @@ def page_html() -> str:
   });
 
   els.messageInput.addEventListener("input", () => {
-    els.messageInput.style.height = "auto";
-    els.messageInput.style.height = Math.min(220, els.messageInput.scrollHeight) + "px";
     sendTyping();
   });
 
-  els.searchInput.addEventListener("input", () => {
-    renderMessages(roomId());
-  });
-
-  els.jumpPinsBtn.addEventListener("click", () => {
-    const firstPin = els.pins.querySelector("button[data-jump]");
-    if (firstPin) firstPin.click();
-  });
+  els.sendBtn.onclick = sendMessage;
 
   window.addEventListener("online", () => {
     setStatus("back online");
@@ -1703,7 +1551,7 @@ def page_html() -> str:
     setStatus("offline");
   });
 
-  renderAll();
+  renderShell();
   connectSocket(true);
 })();
 </script>
