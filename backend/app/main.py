@@ -84,8 +84,9 @@ class RoomState:
     def append_history(self, room: str, payload: dict) -> None:
         self.ensure(room)
         self.history[room].append(payload)
-        if len(self.history[room]) > 400:
-            self.history[room] = self.history[room][-400:]
+        # Keep history slightly shorter if we are allowing base64 attachments to save RAM
+        if len(self.history[room]) > 200:
+            self.history[room] = self.history[room][-200:]
 
     def get_message_by_id(self, room: str, msg_id: str) -> Optional[dict]:
         self.ensure(room)
@@ -145,7 +146,7 @@ class RoomState:
             {
                 "kind": "history",
                 "room": room,
-                "messages": self.history[room][-150:],
+                "messages": self.history[room][-100:],
                 "users": self.current_users(room),
                 "pins": self.build_pins(room),
                 "time": int(time.time() * 1000),
@@ -220,7 +221,7 @@ async def room_socket(websocket: WebSocket, room_id: str):
 
                 is_new = rooms.register(room_id, client_id, display_name, websocket)
                 if is_new:
-                    await rooms.system(room_id, f"{display_name} joined the server.")
+                    await rooms.system(room_id, f"**{display_name}** slid into the server.")
                 await rooms.send_history(room_id, websocket)
                 await rooms.send_presence(room_id)
                 continue
@@ -291,8 +292,37 @@ async def room_socket(websocket: WebSocket, room_id: str):
                 )
                 continue
 
+            if kind == "edit":
+                msg_id = str(data.get("msg_id") or "")
+                new_text = str(data.get("text") or "").strip()
+                msg = rooms.get_message_by_id(room_id, msg_id)
+                if msg and msg.get("client_id") == client_id:
+                    msg["text"] = new_text
+                    msg["edited"] = True
+                    await rooms.broadcast(room_id, {
+                        "kind": "edit_update",
+                        "msg_id": msg_id,
+                        "text": new_text,
+                        "room": room_id
+                    })
+                continue
+
+            if kind == "delete":
+                msg_id = str(data.get("msg_id") or "")
+                msg = rooms.get_message_by_id(room_id, msg_id)
+                if msg and msg.get("client_id") == client_id:
+                    rooms.history[room_id] = [m for m in rooms.history[room_id] if m.get("msg_id") != msg_id]
+                    await rooms.broadcast(room_id, {
+                        "kind": "delete_update",
+                        "msg_id": msg_id,
+                        "room": room_id
+                    })
+                continue
+
             text = str(data.get("text") or "").strip()
-            if not text:
+            attachment = data.get("attachment")
+            
+            if not text and not attachment:
                 continue
 
             reply_to = data.get("reply_to")
@@ -317,6 +347,7 @@ async def room_socket(websocket: WebSocket, room_id: str):
                 "reply_to": reply_to,
                 "reply_preview": reply_preview,
                 "reactions": {},
+                "attachment": attachment
             }
 
             rooms.append_history(room_id, message)
@@ -365,9 +396,8 @@ def page_html() -> str:
     ::-webkit-scrollbar-thumb:hover { background: #111214; }
 
     *{box-sizing:border-box}
-    html,body{height:100%}
+    html,body{height:100%; margin:0; padding:0;}
     body{
-      margin:0;
       padding-top: env(safe-area-inset-top);
       padding-bottom: env(safe-area-inset-bottom);
       padding-left: env(safe-area-inset-left);
@@ -376,6 +406,8 @@ def page_html() -> str:
       background:var(--bg);
       color:var(--text);
       overflow:hidden;
+      display: flex;
+      flex-direction: column;
     }
     button,input,textarea{font:inherit}
 
@@ -384,6 +416,7 @@ def page_html() -> str:
       display:grid;
       grid-template-columns: 72px 240px minmax(0,1fr) 268px;
       min-width:0;
+      flex: 1;
     }
 
     .servers{
@@ -462,12 +495,6 @@ def page_html() -> str:
       font-size:16px;
       font-weight: 800;
       line-height:1.2;
-    }
-    .brand small{
-      display:block;
-      margin-top:2px;
-      color:var(--muted);
-      font-size:12px;
     }
     .section{
       padding:16px 8px 8px;
@@ -600,6 +627,7 @@ def page_html() -> str:
       flex-direction:column;
       background:var(--bg);
       overflow:hidden;
+      position: relative;
     }
 
     .main-top{
@@ -686,6 +714,8 @@ def page_html() -> str:
       min-height:0;
       overflow-y:auto;
       padding:16px 0 24px;
+      display: flex;
+      flex-direction: column;
     }
 
     .msg{
@@ -784,7 +814,31 @@ def page_html() -> str:
     }
     .text b { font-weight: 700; color: #fff; }
     .text i { font-style: italic; }
+    .edited-mark { font-size: 11px; color: var(--muted); margin-left: 4px; user-select: none; }
     
+    .attachment-img {
+      max-width: 400px;
+      max-height: 300px;
+      border-radius: 8px;
+      margin-top: 8px;
+      cursor: pointer;
+      display: block;
+    }
+    .attachment-file {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      background: #2b2d31;
+      padding: 8px 12px;
+      border-radius: 4px;
+      border: 1px solid #1e1f22;
+      margin-top: 8px;
+      text-decoration: none;
+      color: var(--accent);
+      font-weight: 500;
+    }
+    .attachment-file:hover { background: #383a40; }
+
     .replybox{
       display: flex;
       align-items: center;
@@ -886,6 +940,21 @@ def page_html() -> str:
       background:var(--bg);
       position: relative;
     }
+    .preview-bar {
+      background: #2b2d31;
+      padding: 8px 12px;
+      border-radius: 8px 8px 0 0;
+      display: none;
+      align-items: center;
+      justify-content: space-between;
+      border: 1px solid rgba(255,255,255,.04);
+      border-bottom: none;
+    }
+    .preview-bar.active { display: flex; }
+    .preview-content { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+    .preview-content img { width: 40px; height: 40px; border-radius: 4px; object-fit: cover; }
+    .remove-attachment { background: none; border: none; color: var(--danger); cursor: pointer; font-weight: bold; }
+
     .composer-wrap{
       display:flex;
       align-items:flex-start;
@@ -894,6 +963,26 @@ def page_html() -> str:
       border-radius:8px;
       background:#383a40;
     }
+    .preview-bar.active + .composer-wrap { border-radius: 0 0 8px 8px; }
+    
+    .attach-btn {
+      background: #b5bac1;
+      color: #383a40;
+      border: none;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      display: grid;
+      place-items: center;
+      cursor: pointer;
+      font-weight: bold;
+      font-size: 18px;
+      line-height: 1;
+      margin-top: -2px;
+      transition: .2s;
+    }
+    .attach-btn:hover { background: #dbdee1; }
+
     .composer textarea{
       flex:1;
       min-height:24px;
@@ -1103,7 +1192,13 @@ def page_html() -> str:
       <div class="typing" id="typingLine"></div>
 
       <div class="composer">
+        <div class="preview-bar" id="attachmentPreview">
+           <div class="preview-content" id="attachmentContent"></div>
+           <button class="remove-attachment" id="removeAttachmentBtn">X</button>
+        </div>
         <div class="composer-wrap">
+          <button id="attachBtn" class="attach-btn" title="Upload a file or image">+</button>
+          <input type="file" id="fileInput" style="display:none;" />
           <textarea id="messageInput" placeholder="Message #general"></textarea>
           <button class="send" id="sendBtn" title="Send message">
              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
@@ -1197,6 +1292,12 @@ def page_html() -> str:
     closeSettings: document.getElementById("closeSettings"),
     saveSettings: document.getElementById("saveSettings"),
     emojiPicker: document.getElementById("emojiPicker"),
+    
+    attachBtn: document.getElementById("attachBtn"),
+    fileInput: document.getElementById("fileInput"),
+    attachmentPreview: document.getElementById("attachmentPreview"),
+    attachmentContent: document.getElementById("attachmentContent"),
+    removeAttachmentBtn: document.getElementById("removeAttachmentBtn"),
   };
 
   const localClientId = localStorage.getItem("linkup_client_id") || ("cli_" + Math.random().toString(36).slice(2, 10));
@@ -1219,11 +1320,13 @@ def page_html() -> str:
   let activeEmojiTarget = null;
   let lastMessageSender = null;
   let lastMessageTime = 0;
+  let editingMessageId = null;
+  
+  let currentAttachment = null;
 
   const roomMessages = new Map();
   const roomSeen = new Map();
   const roomPresence = new Map();
-  const reactionMap = new Map();
 
   function updateUserInfo() {
     els.myNameDisplay.textContent = displayName;
@@ -1233,11 +1336,14 @@ def page_html() -> str:
   updateUserInfo();
 
   function parseMarkdown(text) {
+    if (!text) return "";
     let esc = String(text).replace(/[&<>"']/g, s => ({"&": "&amp;","<": "&lt;",">": "&gt;","\"": "&quot;","'": "&#39;"}[s]));
     esc = esc.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
     esc = esc.replace(/\*(.*?)\*/g, '<i>$1</i>');
     esc = esc.replace(/`(.*?)`/g, '<code>$1</code>');
     esc = esc.replace(/```([\s\S]*?)```/g, '<pre>$1</pre>');
+    // Simple URL parsing
+    esc = esc.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" style="color:var(--accent); text-decoration:none;">$1</a>');
     return esc;
   }
 
@@ -1245,8 +1351,15 @@ def page_html() -> str:
     return new Date(ts || Date.now()).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   }
 
-  function fmtDate(ts) {
-    return new Date(ts || Date.now()).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
+  function fmtDateDiscord(ts) {
+    const d = new Date(ts || Date.now());
+    const today = new Date();
+    const yesterday = new Date(today);
+    yesterday.setDate(yesterday.getDate() - 1);
+    
+    if (d.toDateString() === today.toDateString()) return "Today at " + fmtTime(ts);
+    if (d.toDateString() === yesterday.toDateString()) return "Yesterday at " + fmtTime(ts);
+    return d.toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" }) + " " + fmtTime(ts);
   }
 
   function currentChannel() {
@@ -1268,7 +1381,6 @@ def page_html() -> str:
       roomMessages.set(room, []);
       roomSeen.set(room, new Set());
       roomPresence.set(room, []);
-      reactionMap.set(room, new Map());
     }
   }
 
@@ -1287,6 +1399,44 @@ def page_html() -> str:
     return roomMessages.get(roomId());
   }
 
+  // File Upload Logic
+  els.attachBtn.onclick = () => els.fileInput.click();
+  
+  els.fileInput.onchange = (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    if (file.size > 5 * 1024 * 1024) { // 5MB limit
+      alert("File is too large (max 5MB limit for this demo).");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      currentAttachment = {
+        name: file.name,
+        type: file.type,
+        data: reader.result
+      };
+      showAttachmentPreview();
+    };
+    reader.readAsDataURL(file);
+    els.fileInput.value = ""; // reset
+  };
+
+  function showAttachmentPreview() {
+    if (!currentAttachment) return;
+    els.attachmentPreview.classList.add("active");
+    if (currentAttachment.type.startsWith("image/")) {
+      els.attachmentContent.innerHTML = `<img src="${currentAttachment.data}" /> <span>${currentAttachment.name}</span>`;
+    } else {
+      els.attachmentContent.innerHTML = `<span>📁 ${currentAttachment.name}</span>`;
+    }
+  }
+  
+  els.removeAttachmentBtn.onclick = () => {
+    currentAttachment = null;
+    els.attachmentPreview.classList.remove("active");
+  };
+
   function renderServers() {
     els.servers.innerHTML = servers.map(s => `
       <button class="server-btn ${s.id === selectedServer ? "active" : ""}" data-server="${s.id}" title="${s.label}">
@@ -1298,7 +1448,7 @@ def page_html() -> str:
       btn.onclick = () => {
         selectedServer = btn.dataset.server;
         selectedChannel = channelsByServer[selectedServer][0].id;
-        replyTo = null;
+        resetComposer();
         localStorage.setItem("linkup_server", selectedServer);
         localStorage.setItem("linkup_channel", selectedChannel);
         renderShell();
@@ -1320,13 +1470,22 @@ def page_html() -> str:
     els.channels.querySelectorAll("button").forEach(btn => {
       btn.onclick = () => {
         selectedChannel = btn.dataset.channel;
-        replyTo = null;
+        resetComposer();
         localStorage.setItem("linkup_channel", selectedChannel);
         els.messageInput.placeholder = `Message #${selectedChannel}`;
         renderShell();
         connectSocket(true);
       };
     });
+  }
+
+  function resetComposer() {
+    replyTo = null;
+    editingMessageId = null;
+    currentAttachment = null;
+    els.attachmentPreview.classList.remove("active");
+    els.messageInput.value = "";
+    els.messageInput.style.height = '24px';
   }
 
   function renderTop() {
@@ -1354,6 +1513,7 @@ def page_html() -> str:
     const reactions = m.reactions || {};
     const reactionKeys = Object.keys(reactions);
     const initial = (m.name || "?").trim().slice(0, 1).toUpperCase();
+    const isSelf = m.client_id === localClientId;
 
     if (m.kind === "system") {
       return `
@@ -1363,15 +1523,24 @@ def page_html() -> str:
         </div>
       `;
     }
+    
+    let attachHtml = "";
+    if (m.attachment) {
+      if (m.attachment.type.startsWith("image/")) {
+        attachHtml = `<img src="${m.attachment.data}" class="attachment-img" alt="Attachment" />`;
+      } else {
+        attachHtml = `<a href="${m.attachment.data}" download="${m.attachment.name}" class="attachment-file">📄 ${m.attachment.name}</a>`;
+      }
+    }
 
     return `
-      <div class="msg ${isCompact ? 'compact' : ''}" data-id="${parseMarkdown(m.msg_id)}">
+      <div class="msg ${isCompact ? 'compact' : ''}" data-id="${parseMarkdown(m.msg_id)}" id="msg_${m.msg_id}">
         ${isCompact ? `<div class="compact-time">${fmtTime(m.time)}</div>` : `<div class="avatar-wrapper">${initial}</div>`}
         <div class="content">
           ${!isCompact ? `
           <div class="header">
             <div class="name">${parseMarkdown(m.name || "Guest")}</div>
-            <div class="time">${fmtDate(m.time)} ${fmtTime(m.time)}</div>
+            <div class="time">${fmtDateDiscord(m.time)}</div>
           </div>
           ` : ''}
           ${m.reply_preview ? `
@@ -1380,7 +1549,8 @@ def page_html() -> str:
               <span><b>${parseMarkdown(m.reply_preview.name || "Guest")}</b> ${parseMarkdown((m.reply_preview.text || "").slice(0, 60))}</span>
             </div>
           ` : ""}
-          <div class="text">${parseMarkdown(m.text || "")}</div>
+          <div class="text">${parseMarkdown(m.text || "")}${m.edited ? '<span class="edited-mark">(edited)</span>' : ''}</div>
+          ${attachHtml}
           <div class="reactions">
             ${reactionKeys.map(e => `
               <div class="reaction ${reactions[e] > 0 ? 'reacted' : ''}" data-action="react" data-id="${parseMarkdown(m.msg_id)}" data-emoji="${e}">
@@ -1391,7 +1561,10 @@ def page_html() -> str:
           <div class="msg-actions">
             <button data-action="react-prompt" data-id="${parseMarkdown(m.msg_id)}" title="Add Reaction">😊</button>
             <button data-action="reply" data-id="${parseMarkdown(m.msg_id)}" title="Reply">↩️</button>
-            <button data-action="pin" data-id="${parseMarkdown(m.msg_id)}" title="Pin">📌</button>
+            ${isSelf ? `
+            <button data-action="edit" data-id="${parseMarkdown(m.msg_id)}" title="Edit">✏️</button>
+            <button data-action="delete" data-id="${parseMarkdown(m.msg_id)}" title="Delete" style="color:var(--danger)">🗑️</button>
+            ` : ''}
           </div>
         </div>
       </div>
@@ -1426,8 +1599,16 @@ def page_html() -> str:
     });
 
     els.messages.innerHTML = html;
-    els.messages.scrollTop = els.messages.scrollHeight;
+    scrollToBottom(true);
     bindMessageActions();
+  }
+  
+  function scrollToBottom(force = false) {
+    const threshold = 100;
+    const isAtBottom = els.messages.scrollHeight - els.messages.clientHeight <= els.messages.scrollTop + threshold;
+    if (force || isAtBottom) {
+      els.messages.scrollTop = els.messages.scrollHeight;
+    }
   }
 
   function renderShell() {
@@ -1453,7 +1634,7 @@ def page_html() -> str:
     if (room === roomId() && renderNow) {
       const isCompact = (msg.kind === "message" && msg.client_id === lastMessageSender && (msg.time - lastMessageTime < 300000) && !msg.reply_preview);
       els.messages.insertAdjacentHTML("beforeend", renderMessageHtml(msg, isCompact));
-      els.messages.scrollTop = els.messages.scrollHeight;
+      scrollToBottom();
       if (msg.kind === "message") {
         lastMessageSender = msg.client_id;
         lastMessageTime = msg.time;
@@ -1563,6 +1744,19 @@ def page_html() -> str:
         if (target) { target.reactions = data.reactions || {}; renderMessages(); }
         return;
       }
+      
+      if (data.kind === "edit_update") {
+        const target = roomList().find(m => m.msg_id === data.msg_id);
+        if (target) { target.text = data.text; target.edited = true; renderMessages(); }
+        return;
+      }
+      
+      if (data.kind === "delete_update") {
+        const list = roomList();
+        const idx = list.findIndex(m => m.msg_id === data.msg_id);
+        if (idx !== -1) { list.splice(idx, 1); renderMessages(); }
+        return;
+      }
 
       if (data.kind === "message") {
         data.time = data.time || Date.now();
@@ -1584,8 +1778,26 @@ def page_html() -> str:
 
   function sendMessage() {
     const text = els.messageInput.value.trim();
-    if (!text) return;
+    if (!text && !currentAttachment) return;
 
+    // Handle Editing existing message
+    if (editingMessageId) {
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({
+          kind: "edit",
+          msg_id: editingMessageId,
+          text: text,
+          client_id: localClientId,
+          room: roomId(),
+          time: Date.now()
+        }));
+      }
+      resetComposer();
+      els.messageInput.placeholder = `Message #${selectedChannel}`;
+      return;
+    }
+
+    // New Message
     const payload = {
       kind: "message",
       msg_id: `cli_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
@@ -1594,6 +1806,7 @@ def page_html() -> str:
       text,
       room: roomId(),
       reply_to: replyTo,
+      attachment: currentAttachment,
       time: Date.now()
     };
 
@@ -1605,10 +1818,8 @@ def page_html() -> str:
     pushMessage(roomId(), payload, true);
     if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(payload));
 
-    replyTo = null;
+    resetComposer();
     els.messageInput.placeholder = `Message #${selectedChannel}`;
-    els.messageInput.value = "";
-    els.messageInput.style.height = '24px';
     els.messageInput.focus();
   }
 
@@ -1631,10 +1842,23 @@ def page_html() -> str:
           els.messageInput.focus();
           return;
         }
+        
+        if (action === "edit") {
+          editingMessageId = id;
+          const original = roomList().find(m => m.msg_id === id);
+          if (original) {
+            els.messageInput.value = original.text;
+            els.messageInput.placeholder = "Editing message...";
+            els.messageInput.focus();
+          }
+          return;
+        }
 
-        if (action === "pin") {
-          if (!socket || socket.readyState !== WebSocket.OPEN) return;
-          socket.send(JSON.stringify({ kind: "pin", client_id: localClientId, name: displayName, room, msg_id: id, time: Date.now() }));
+        if (action === "delete") {
+          if (confirm("Are you sure you want to delete this message?")) {
+            if (!socket || socket.readyState !== WebSocket.OPEN) return;
+            socket.send(JSON.stringify({ kind: "delete", client_id: localClientId, room, msg_id: id }));
+          }
           return;
         }
 
@@ -1646,7 +1870,7 @@ def page_html() -> str:
         if (action === "react-prompt") {
           const rect = btn.getBoundingClientRect();
           els.emojiPicker.style.top = `${rect.top - 40}px`;
-          els.emojiPicker.style.left = `${rect.left - 150}px`;
+          els.emojiPicker.style.left = `${Math.max(10, rect.left - 150)}px`;
           els.emojiPicker.classList.add("active");
           activeEmojiTarget = id;
           e.stopPropagation();
@@ -1674,6 +1898,10 @@ def page_html() -> str:
 
   els.messageInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+    if (e.key === "Escape" && editingMessageId) {
+      resetComposer();
+      els.messageInput.placeholder = `Message #${selectedChannel}`;
+    }
   });
 
   els.messageInput.addEventListener("input", () => {
@@ -1736,4 +1964,5 @@ def api_root():
 @app.get("/{path:path}", response_class=HTMLResponse)
 def spa_fallback(path: str):
     return HTMLResponse(content=page_html())
+
 
