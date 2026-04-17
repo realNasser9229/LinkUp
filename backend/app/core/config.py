@@ -3,11 +3,11 @@ import os
 
 class Settings:
     def __init__(self) -> None:
-        origins = os.getenv("CORS_ORIGINS", "*")
-        if origins.strip() == "*":
+        origins = os.getenv("CORS_ORIGINS", "*").strip()
+        if origins == "*":
             self.cors_origins = ["*"]
         else:
-            self.cors_origins = [origin.strip() for origin in origins.split(",") if origin.strip()]
+            self.cors_origins = [o.strip() for o in origins.split(",") if o.strip()]
 
 
 settings = Settings()
