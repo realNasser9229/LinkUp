@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from typing import Dict, List
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -14,17 +16,20 @@ class ConnectionManager:
         self.rooms.setdefault(room_id, []).append(websocket)
 
     def disconnect(self, room_id: str, websocket: WebSocket) -> None:
-        connections = self.rooms.get(room_id)
-        if not connections:
+        sockets = self.rooms.get(room_id)
+        if not sockets:
             return
-        if websocket in connections:
-            connections.remove(websocket)
-        if not connections:
+        if websocket in sockets:
+            sockets.remove(websocket)
+        if not sockets:
             self.rooms.pop(room_id, None)
 
-    async def broadcast(self, room_id: str, message: str) -> None:
+    async def broadcast_json(self, room_id: str, payload: dict) -> None:
         for ws in list(self.rooms.get(room_id, [])):
-            await ws.send_text(message)
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                pass
 
 
 manager = ConnectionManager()
@@ -35,7 +40,7 @@ async def room_socket(websocket: WebSocket, room_id: str):
     await manager.connect(room_id, websocket)
     try:
         while True:
-            message = await websocket.receive_text()
-            await manager.broadcast(room_id, message)
+            data = await websocket.receive_json()
+            await manager.broadcast_json(room_id, data)
     except WebSocketDisconnect:
         manager.disconnect(room_id, websocket)
