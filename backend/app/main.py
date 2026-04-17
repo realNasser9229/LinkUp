@@ -1,13 +1,28 @@
 from __future__ import annotations
 
-from fastapi import FastAPI
+import json
+import os
+import time
+from typing import Dict, List
+from uuid import uuid4
+
+from fastapi import APIRouter, FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-from app.api.websocket import router as ws_router
-from app.core.config import settings
-
 app = FastAPI(title="LinkUp")
+
+
+class Settings:
+    def __init__(self) -> None:
+        origins = os.getenv("CORS_ORIGINS", "*").strip()
+        if origins == "*":
+            self.cors_origins = ["*"]
+        else:
+            self.cors_origins = [o.strip() for o in origins.split(",") if o.strip()]
+
+
+settings = Settings()
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,11 +32,71 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+ws_router = APIRouter()
+
+
+class ConnectionManager:
+    def __init__(self) -> None:
+        self.rooms: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, room_id: str, websocket: WebSocket) -> None:
+        await websocket.accept()
+        self.rooms.setdefault(room_id, []).append(websocket)
+
+    def disconnect(self, room_id: str, websocket: WebSocket) -> None:
+        sockets = self.rooms.get(room_id)
+        if not sockets:
+            return
+        if websocket in sockets:
+            sockets.remove(websocket)
+        if not sockets:
+            self.rooms.pop(room_id, None)
+
+    async def broadcast_json(self, room_id: str, payload: dict) -> None:
+        for ws in list(self.rooms.get(room_id, [])):
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                pass
+
+
+manager = ConnectionManager()
+
+# -------------------------
+# WebSocket route
+# -------------------------
+@ws_router.websocket("/{room_id}")
+async def room_socket(websocket: WebSocket, room_id: str):
+    await manager.connect(room_id, websocket)
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    data = {"kind": "message", "text": str(data)}
+            except Exception:
+                data = {"kind": "message", "text": raw}
+
+            data.setdefault("kind", "message")
+            data.setdefault("room", room_id)
+            data.setdefault("time", int(time.time() * 1000))
+            data.setdefault("msg_id", str(uuid4()))
+            data.setdefault("client_id", "unknown")
+
+            await manager.broadcast_json(room_id, data)
+    except WebSocketDisconnect:
+        manager.disconnect(room_id, websocket)
+
+
 app.include_router(ws_router, prefix="/ws", tags=["websocket"])
 
 
+# -------------------------
+# UI
+# -------------------------
 def page_html() -> str:
-    return """<!doctype html>
+    return r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -29,17 +104,17 @@ def page_html() -> str:
   <title>LinkUp</title>
   <style>
     :root{
-      --bg:#0b1020;
-      --bg2:#111833;
-      --panel:#0f1730;
-      --panel2:#121c3a;
-      --line:#23315e;
-      --text:#ecf2ff;
-      --muted:#97a6cc;
-      --accent:#7c8cff;
-      --accent2:#6ef3c5;
-      --danger:#ff6b7a;
-      --shadow:0 24px 80px rgba(0,0,0,.42);
+      --bg:#070b16;
+      --bg2:#0c1224;
+      --panel:rgba(13, 20, 40, .86);
+      --panel2:rgba(18, 27, 54, .92);
+      --line:rgba(255,255,255,.08);
+      --text:#eef3ff;
+      --muted:#9ba9d1;
+      --accent:#7b8cff;
+      --accent2:#67f0c2;
+      --danger:#ff6c81;
+      --shadow:0 28px 90px rgba(0,0,0,.42);
       --radius:22px;
       color-scheme: dark;
     }
@@ -48,29 +123,30 @@ def page_html() -> str:
     body{
       margin:0;
       font-family: Inter, ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-      background:
-        radial-gradient(circle at top left, rgba(124,140,255,.20), transparent 35%),
-        radial-gradient(circle at top right, rgba(110,243,197,.12), transparent 30%),
-        linear-gradient(180deg, #080d1a 0%, #0a0f1f 100%);
       color:var(--text);
+      background:
+        radial-gradient(circle at 10% 10%, rgba(123,140,255,.18), transparent 26%),
+        radial-gradient(circle at 90% 0%, rgba(103,240,194,.12), transparent 22%),
+        linear-gradient(180deg, #060914 0%, #080d19 100%);
     }
-    a{color:inherit}
-    button,input{font:inherit}
+    button,input,textarea{font:inherit}
     .app{
-      display:grid;
-      grid-template-columns: 84px 280px minmax(0,1fr) 320px;
-      gap:16px;
-      padding:16px;
       height:100vh;
+      padding:16px;
+      display:grid;
+      grid-template-columns: 84px 270px minmax(0,1fr) 300px;
+      gap:16px;
     }
     .glass{
-      background: rgba(15, 23, 48, .82);
+      background:var(--panel);
       backdrop-filter: blur(18px);
-      border:1px solid rgba(255,255,255,.06);
-      box-shadow: var(--shadow);
+      border:1px solid var(--line);
+      box-shadow:var(--shadow);
     }
+
+    /* Server rail */
     .servers{
-      border-radius: var(--radius);
+      border-radius:var(--radius);
       padding:12px 8px;
       display:flex;
       flex-direction:column;
@@ -78,99 +154,185 @@ def page_html() -> str:
       gap:10px;
       overflow:auto;
     }
-    .sbtn{
-      width:56px;height:56px;border:none;border-radius:18px;
-      background:linear-gradient(180deg, #1a2447, #101936);
-      color:var(--text);
+    .server-btn{
+      width:56px;height:56px;
+      border:none;
+      border-radius:18px;
       cursor:pointer;
-      display:grid;place-items:center;
-      font-weight:800;
-      letter-spacing:.2px;
-      transition:.18s ease;
+      color:var(--text);
+      background:linear-gradient(180deg, #1a2448, #0f1833);
       border:1px solid rgba(255,255,255,.05);
+      display:grid;
+      place-items:center;
+      font-weight:800;
+      transition:.16s ease;
+      flex:0 0 auto;
     }
-    .sbtn:hover{transform:translateY(-1px); border-color: rgba(124,140,255,.35)}
-    .sbtn.active{background:linear-gradient(180deg, #7c8cff, #5d6aff); color:#fff; box-shadow:0 10px 25px rgba(124,140,255,.30)}
+    .server-btn:hover{transform:translateY(-1px); border-color:rgba(123,140,255,.35)}
+    .server-btn.active{
+      background:linear-gradient(180deg, #7b8cff, #5968ff);
+      box-shadow:0 14px 30px rgba(123,140,255,.24);
+      color:#fff;
+    }
+
+    /* Channel sidebar */
     .sidebar{
       border-radius:var(--radius);
+      overflow:hidden;
       display:flex;
       flex-direction:column;
       min-width:0;
-      overflow:hidden;
     }
     .side-top{
       padding:18px 18px 14px;
-      border-bottom:1px solid rgba(255,255,255,.06);
+      border-bottom:1px solid var(--line);
+      background:linear-gradient(180deg, rgba(255,255,255,.01), rgba(255,255,255,.02));
     }
     .brand{
-      display:flex;align-items:center;justify-content:space-between;gap:10px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:12px;
     }
-    .brand h1{margin:0;font-size:22px;letter-spacing:.2px}
-    .brand small{color:var(--muted)}
-    .chip{
-      display:inline-flex;align-items:center;gap:8px;
-      border:1px solid rgba(255,255,255,.08);
+    .brand h1{
+      margin:0;
+      font-size:22px;
+      letter-spacing:.2px;
+    }
+    .brand small{
+      display:block;
+      margin-top:4px;
       color:var(--muted);
-      padding:8px 10px;border-radius:999px;
+      font-size:12px;
+    }
+    .pill{
+      display:inline-flex;
+      align-items:center;
+      gap:8px;
       margin-top:12px;
+      padding:8px 10px;
+      border-radius:999px;
+      border:1px solid rgba(255,255,255,.08);
+      background:rgba(255,255,255,.03);
+      color:#cdd7ff;
       font-size:12px;
       width:fit-content;
     }
     .section{
       padding:14px 14px 10px;
     }
-    .section h3{
+    .section-title{
       margin:0 0 10px;
+      color:#b7c4ea;
       font-size:12px;
       text-transform:uppercase;
       letter-spacing:.14em;
-      color:#b6c2e8;
     }
     .channel{
       width:100%;
       border:none;
-      background:transparent;
       color:var(--text);
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
-      gap:10px;
-      padding:12px 12px;
+      background:transparent;
       border-radius:14px;
+      padding:12px;
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
       cursor:pointer;
-      transition:.16s ease;
       text-align:left;
+      transition:.15s ease;
+      margin-bottom:6px;
     }
     .channel:hover{background:rgba(255,255,255,.04)}
-    .channel.active{background:rgba(124,140,255,.16); outline:1px solid rgba(124,140,255,.28)}
-    .channel .meta{display:flex;flex-direction:column;min-width:0}
+    .channel.active{
+      background:rgba(123,140,255,.16);
+      outline:1px solid rgba(123,140,255,.28);
+    }
+    .channel .meta{
+      display:flex;
+      flex-direction:column;
+      min-width:0;
+    }
     .channel .meta strong{font-size:14px}
-    .channel .meta span{font-size:12px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:170px}
+    .channel .meta span{
+      color:var(--muted);
+      font-size:12px;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      white-space:nowrap;
+      max-width:180px;
+    }
+    .badge{
+      font-size:11px;
+      padding:3px 8px;
+      border-radius:999px;
+      background:rgba(123,140,255,.14);
+      color:#d6dcff;
+      border:1px solid rgba(123,140,255,.18);
+      flex:0 0 auto;
+    }
+    .footer-note{
+      margin-top:auto;
+      padding:14px 16px;
+      border-top:1px solid var(--line);
+      color:var(--muted);
+      font-size:12px;
+      line-height:1.6;
+    }
+    .kbd{
+      display:inline-flex;
+      align-items:center;
+      justify-content:center;
+      min-width:24px;
+      padding:2px 6px;
+      border-radius:6px;
+      border:1px solid rgba(255,255,255,.08);
+      background:rgba(255,255,255,.04);
+      color:#dbe3ff;
+      font-size:11px;
+    }
+
+    /* Main chat */
     .main{
       border-radius:var(--radius);
       display:flex;
       flex-direction:column;
       min-width:0;
       overflow:hidden;
+      background:
+        radial-gradient(circle at top, rgba(123,140,255,.08), transparent 20%),
+        var(--panel2);
     }
     .main-top{
       padding:18px 20px;
-      border-bottom:1px solid rgba(255,255,255,.06);
+      border-bottom:1px solid var(--line);
       display:flex;
       align-items:center;
       justify-content:space-between;
-      gap:12px;
+      gap:14px;
     }
-    .titleblock h2{margin:0;font-size:20px}
-    .titleblock p{margin:5px 0 0;color:var(--muted);font-size:13px}
-    .status{
-      display:flex;align-items:center;gap:8px;
+    .titleblock h2{
+      margin:0;
+      font-size:20px;
+    }
+    .titleblock p{
+      margin:5px 0 0;
       color:var(--muted);
       font-size:13px;
     }
+    .conn{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      color:var(--muted);
+      font-size:13px;
+      white-space:nowrap;
+    }
     .dot{
       width:10px;height:10px;border-radius:999px;background:var(--accent2);
-      box-shadow:0 0 0 4px rgba(110,243,197,.12);
+      box-shadow:0 0 0 4px rgba(103,240,194,.12);
+      flex:0 0 auto;
     }
     .messages{
       flex:1;
@@ -178,7 +340,7 @@ def page_html() -> str:
       padding:18px;
       display:flex;
       flex-direction:column;
-      gap:14px;
+      gap:12px;
       scroll-behavior:smooth;
     }
     .msg{
@@ -186,36 +348,42 @@ def page_html() -> str:
       grid-template-columns:44px minmax(0,1fr);
       gap:12px;
       padding:14px;
-      border:1px solid rgba(255,255,255,.06);
       border-radius:18px;
-      background:rgba(255,255,255,.02);
+      border:1px solid rgba(255,255,255,.06);
+      background:rgba(255,255,255,.025);
     }
     .avatar{
       width:44px;height:44px;border-radius:16px;
-      background:linear-gradient(180deg, #7c8cff, #4a57ff);
       display:grid;place-items:center;
-      font-weight:800;
+      background:linear-gradient(180deg, #7b8cff, #5262ff);
       color:#fff;
+      font-weight:800;
+      flex:0 0 auto;
     }
-    .msg .head{
-      display:flex;align-items:center;justify-content:space-between;gap:10px;
-      margin-bottom:5px;
+    .head{
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:10px;
+      margin-bottom:4px;
     }
-    .msg .name{
-      display:flex;align-items:center;gap:8px;
+    .name{
+      display:flex;
+      align-items:center;
+      gap:8px;
       font-weight:700;
+      min-width:0;
     }
-    .badge{
-      font-size:11px;padding:3px 8px;border-radius:999px;
-      background:rgba(124,140,255,.14);
-      color:#cfd7ff;
-      border:1px solid rgba(124,140,255,.18);
+    .time{color:var(--muted);font-size:12px;flex:0 0 auto}
+    .text{
+      white-space:pre-wrap;
+      word-break:break-word;
+      line-height:1.55;
+      color:#eef2ff;
     }
-    .time{color:var(--muted);font-size:12px}
-    .text{line-height:1.6;color:#ebf0ff;white-space:pre-wrap;word-break:break-word}
     .composer{
       padding:16px;
-      border-top:1px solid rgba(255,255,255,.06);
+      border-top:1px solid var(--line);
       background:linear-gradient(180deg, rgba(255,255,255,.01), rgba(255,255,255,.03));
     }
     .composer-wrap{
@@ -224,10 +392,10 @@ def page_html() -> str:
       gap:12px;
       padding:12px;
       border-radius:18px;
-      background:#0b1328;
+      background:#091222;
       border:1px solid rgba(255,255,255,.06);
     }
-    textarea{
+    .composer textarea{
       flex:1;
       resize:none;
       min-height:48px;
@@ -241,73 +409,89 @@ def page_html() -> str:
     }
     .send{
       border:none;
-      background:linear-gradient(180deg, #7c8cff, #5564ff);
+      background:linear-gradient(180deg, #7b8cff, #5566ff);
       color:#fff;
       padding:13px 18px;
       border-radius:14px;
       cursor:pointer;
       font-weight:700;
-      box-shadow:0 14px 30px rgba(124,140,255,.22);
+      box-shadow:0 14px 30px rgba(123,140,255,.22);
     }
     .send:hover{filter:brightness(1.04)}
+
+    /* Right panel */
     .tools{
       border-radius:var(--radius);
+      overflow:hidden;
       display:flex;
       flex-direction:column;
       min-width:0;
-      overflow:hidden;
     }
-    .tools .panel{
+    .panel{
       padding:16px;
-      border-bottom:1px solid rgba(255,255,255,.06);
+      border-bottom:1px solid var(--line);
     }
-    .tools h3{margin:0 0 10px;font-size:14px}
-    .tools p, .tools li{color:var(--muted);font-size:13px;line-height:1.6}
+    .panel h3{
+      margin:0 0 10px;
+      font-size:14px;
+    }
+    .panel p, .panel li{
+      color:var(--muted);
+      font-size:13px;
+      line-height:1.6;
+    }
     .input{
       width:100%;
       margin-top:10px;
       padding:12px 14px;
       border-radius:14px;
       border:1px solid rgba(255,255,255,.08);
-      background:#0b1328;
+      background:#091222;
       color:var(--text);
       outline:none;
     }
-    .mini-list{
-      display:flex;flex-direction:column;gap:10px;
-      margin:0;padding:0;list-style:none;
+    .list{
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+      margin:0;
+      padding:0;
+      list-style:none;
     }
     .user{
-      display:flex;align-items:center;justify-content:space-between;gap:8px;
-      padding:10px 12px;border-radius:14px;
+      display:flex;
+      align-items:center;
+      justify-content:space-between;
+      gap:8px;
+      padding:10px 12px;
+      border-radius:14px;
       background:rgba(255,255,255,.03);
       border:1px solid rgba(255,255,255,.05);
     }
     .user strong{font-size:13px}
     .user span{font-size:12px;color:var(--muted)}
-    .footer-note{
-      padding:14px 16px;
+    .tiny{
       color:var(--muted);
       font-size:12px;
       line-height:1.6;
-    }
-    .kbd{
-      display:inline-flex;align-items:center;justify-content:center;
-      min-width:24px;padding:2px 6px;border-radius:6px;
-      border:1px solid rgba(255,255,255,.08);
-      background:rgba(255,255,255,.04);
-      color:#dbe3ff;
-      font-size:11px;
+      padding:14px 16px;
     }
 
-    @media (max-width: 1200px){
-      .app{grid-template-columns: 84px 260px minmax(0,1fr); }
+    @media (max-width: 1240px){
+      .app{grid-template-columns: 84px 250px minmax(0,1fr);}
       .tools{display:none}
     }
     @media (max-width: 900px){
-      .app{grid-template-columns: 1fr; height:auto; min-height:100vh}
-      .servers{flex-direction:row; justify-content:flex-start; overflow:auto}
-      .sidebar{min-height:420px}
+      .app{
+        grid-template-columns:1fr;
+        height:auto;
+        min-height:100vh;
+      }
+      .servers{
+        flex-direction:row;
+        justify-content:flex-start;
+        overflow:auto;
+      }
       .main{min-height:70vh}
       .tools{display:block}
     }
@@ -322,20 +506,20 @@ def page_html() -> str:
         <div class="brand">
           <div>
             <h1>LinkUp</h1>
-            <small>better-than-Discord starter</small>
+            <small>real-time chat, but sharper</small>
           </div>
           <div class="badge">LIVE</div>
         </div>
-        <div class="chip">Room: <span id="roomLabel">#general</span></div>
+        <div class="pill">Room: <span id="roomLabel">#general</span></div>
       </div>
 
       <div class="section">
-        <h3>Channels</h3>
+        <h3 class="section-title">Channels</h3>
         <div id="channels"></div>
       </div>
 
       <div class="footer-note">
-        Tip: press <span class="kbd">Enter</span> to send, <span class="kbd">Shift</span> + <span class="kbd">Enter</span> for a new line.
+        Press <span class="kbd">Enter</span> to send, <span class="kbd">Shift</span> + <span class="kbd">Enter</span> for a new line.
       </div>
     </aside>
 
@@ -343,9 +527,9 @@ def page_html() -> str:
       <div class="main-top">
         <div class="titleblock">
           <h2 id="channelTitle"># general</h2>
-          <p id="channelDescription">A fast, clean, real-time room for your crew.</p>
+          <p id="channelDescription">A fast room for your crew.</p>
         </div>
-        <div class="status"><span class="dot"></span><span id="connState">connecting...</span></div>
+        <div class="conn"><span class="dot"></span><span id="connState">connecting...</span></div>
       </div>
 
       <div class="messages" id="messages"></div>
@@ -364,16 +548,19 @@ def page_html() -> str:
         <p>Set your display name. It saves in your browser.</p>
         <input class="input" id="nameInput" maxlength="24" placeholder="Your name" />
       </div>
+
       <div class="panel">
         <h3>Members online</h3>
-        <ul class="mini-list" id="members"></ul>
+        <ul class="list" id="members"></ul>
       </div>
+
       <div class="panel">
-        <h3>LinkUp goals</h3>
+        <h3>What LinkUp is becoming</h3>
         <ul>
-          <li>Servers, channels, DMs, roles</li>
-          <li>Live chat with WebSockets</li>
-          <li>Fast UI, low clutter, more polish</li>
+          <li>Servers and channels</li>
+          <li>DMs and group DMs</li>
+          <li>Roles, perms, moderation</li>
+          <li>Better mobile layout</li>
         </ul>
       </div>
     </aside>
@@ -438,19 +625,26 @@ def page_html() -> str:
 
   let selectedServer = localStorage.getItem("linkup_server") || "home";
   let selectedChannel = localStorage.getItem("linkup_channel") || "general";
-  let socket = null;
-  let reconnectTimer = null;
-  let localId = Math.random().toString(36).slice(2, 9);
 
-  const systemMessages = {
+  let socket = null;
+  let connectionSeq = 0;
+  let reconnectTimer = null;
+  let handshakeTimer = null;
+  let retryCount = 0;
+
+  const localClientId = "cli_" + Math.random().toString(36).slice(2, 10);
+  const roomMessages = new Map();
+  const seenIds = new Set();
+
+  const systemSeeds = {
     general: [
       "Welcome to LinkUp. This room is live.",
-      "You can rename the app, add DMs, roles, and moderation next."
+      "The socket now reconnects cleanly without getting stuck."
     ],
     announcements: ["Ship updates here.", "Use this room for changelogs."],
     showcase: ["Drop your best work here.", "Show your builds and screenshots."],
-    frontend: ["React, CSS, motion, and layout talk."],
-    backend: ["FastAPI, WebSockets, database design."],
+    frontend: ["UI, motion, and layout talk."],
+    backend: ["FastAPI, WebSockets, and database design."],
     bugs: ["Log a bug, then squash it."],
     lobby: ["Find your squad."],
     clips: ["Funny moments belong here."],
@@ -460,39 +654,133 @@ def page_html() -> str:
     focus: ["Deep work zone."]
   };
 
-  function currentChannel() {
-    return channelsByServer[selectedServer].find(c => c.id === selectedChannel) || channelsByServer[selectedServer][0];
-  }
-
   function escapeHtml(str) {
-    return String(str).replace(/[&<>"']/g, s => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[s]));
+    return String(str).replace(/[&<>"']/g, s => ({
+      "&":"&amp;",
+      "<":"&lt;",
+      ">":"&gt;",
+      "\"":"&quot;",
+      "'":"&#39;"
+    }[s]));
   }
 
   function fmtTime(ts) {
-    return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    return new Date(ts || Date.now()).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit"
+    });
+  }
+
+  function currentChannel() {
+    const list = channelsByServer[selectedServer] || [];
+    return list.find(c => c.id === selectedChannel) || list[0];
+  }
+
+  function setStatus(text, connected = false) {
+    els.connState.textContent = text;
+    els.connState.style.color = connected ? "#d7ffe9" : "";
+  }
+
+  function ensureRoom(roomId) {
+    if (!roomMessages.has(roomId)) {
+      const seed = (systemSeeds[roomId] || ["Room loaded."]).map((text, idx) => ({
+        msg_id: `seed-${roomId}-${idx}`,
+        kind: "system",
+        name: "System",
+        text,
+        time: Date.now() - ((idx + 1) * 60000)
+      }));
+      roomMessages.set(roomId, seed);
+      seed.forEach(m => seenIds.add(m.msg_id));
+    }
+  }
+
+  function getRoomMessages(roomId) {
+    ensureRoom(roomId);
+    return roomMessages.get(roomId);
+  }
+
+  function renderMessages(roomId) {
+    const msgs = getRoomMessages(roomId);
+    els.messages.innerHTML = msgs.map(renderMessageHtml).join("");
+    els.messages.scrollTop = els.messages.scrollHeight;
+  }
+
+  function renderMessageHtml(m) {
+    if (m.kind === "system") {
+      return `
+        <div class="msg">
+          <div class="avatar">!</div>
+          <div>
+            <div class="head">
+              <div class="name"><span>System</span><span class="badge">notice</span></div>
+              <span class="time">${fmtTime(m.time)}</span>
+            </div>
+            <div class="text">${escapeHtml(m.text)}</div>
+          </div>
+        </div>`;
+    }
+
+    const initial = (m.name || "?").trim().slice(0, 1).toUpperCase();
+    const isSelf = m.client_id === localClientId;
+
+    return `
+      <div class="msg">
+        <div class="avatar">${escapeHtml(initial)}</div>
+        <div>
+          <div class="head">
+            <div class="name">
+              <span>${escapeHtml(m.name || "Guest")}</span>
+              <span class="badge">${isSelf ? "you" : "member"}</span>
+            </div>
+            <span class="time">${fmtTime(m.time)}</span>
+          </div>
+          <div class="text">${escapeHtml(m.text || "")}</div>
+        </div>
+      </div>`;
+  }
+
+  function addMessage(roomId, msg, renderNow = true) {
+    ensureRoom(roomId);
+    const list = roomMessages.get(roomId);
+
+    if (!msg.msg_id) {
+      msg.msg_id = "msg_" + Math.random().toString(36).slice(2, 14);
+    }
+
+    if (seenIds.has(msg.msg_id)) return;
+    seenIds.add(msg.msg_id);
+    list.push(msg);
+
+    if (roomId === selectedChannel && renderNow) {
+      els.messages.insertAdjacentHTML("beforeend", renderMessageHtml(msg));
+      els.messages.scrollTop = els.messages.scrollHeight;
+    }
   }
 
   function renderServers() {
     els.servers.innerHTML = servers.map(s => `
-      <button class="sbtn ${s.id === selectedServer ? "active" : ""}" data-server="${s.id}" title="${s.label}">
+      <button class="server-btn ${s.id === selectedServer ? "active" : ""}" data-server="${s.id}" title="${s.label}">
         ${s.name}
       </button>
     `).join("");
 
     els.servers.querySelectorAll("button").forEach(btn => {
       btn.onclick = () => {
-        selectedServer = btn.dataset.server;
+        const nextServer = btn.dataset.server;
+        if (nextServer === selectedServer) return;
+        selectedServer = nextServer;
         selectedChannel = channelsByServer[selectedServer][0].id;
         localStorage.setItem("linkup_server", selectedServer);
         localStorage.setItem("linkup_channel", selectedChannel);
         renderAll();
-        connectSocket();
+        connectSocket(true);
       };
     });
   }
 
   function renderChannels() {
-    els.channels.innerHTML = channelsByServer[selectedServer].map(ch => `
+    els.channels.innerHTML = (channelsByServer[selectedServer] || []).map(ch => `
       <button class="channel ${ch.id === selectedChannel ? "active" : ""}" data-channel="${ch.id}">
         <div class="meta">
           <strong>${ch.title}</strong>
@@ -504,10 +792,12 @@ def page_html() -> str:
 
     els.channels.querySelectorAll("button").forEach(btn => {
       btn.onclick = () => {
-        selectedChannel = btn.dataset.channel;
+        const nextChannel = btn.dataset.channel;
+        if (nextChannel === selectedChannel) return;
+        selectedChannel = nextChannel;
         localStorage.setItem("linkup_channel", selectedChannel);
         renderAll();
-        connectSocket();
+        connectSocket(true);
       };
     });
   }
@@ -516,119 +806,20 @@ def page_html() -> str:
     els.members.innerHTML = members.map(m => `
       <li class="user">
         <div>
-          <strong>${escapeHtml(m.name)}</strong><br/>
+          <strong>${escapeHtml(m.name)}</strong><br />
           <span>${escapeHtml(m.role)}</span>
         </div>
-        <span class="badge">${m.role}</span>
+        <span class="badge">${escapeHtml(m.role)}</span>
       </li>
     `).join("");
   }
 
   function setHeader() {
     const ch = currentChannel();
-    els.channelTitle.textContent = ch.title;
-    els.channelDescription.textContent = ch.description;
-    els.roomLabel.textContent = `#${ch.id}`;
-    document.title = `LinkUp — ${ch.title}`;
-  }
-
-  function addMessage({ name, text, time, kind = "message" }) {
-    const initial = (name || "?").trim().slice(0,1).toUpperCase();
-    const html = kind === "system"
-      ? `<div class="msg">
-           <div class="avatar">!</div>
-           <div>
-             <div class="head"><div class="name"><span>System</span><span class="badge">notice</span></div><span class="time">${fmtTime(time)}</span></div>
-             <div class="text">${escapeHtml(text)}</div>
-           </div>
-         </div>`
-      : `<div class="msg">
-           <div class="avatar">${escapeHtml(initial)}</div>
-           <div>
-             <div class="head">
-               <div class="name"><span>${escapeHtml(name)}</span><span class="badge">${kind === "self" ? "you" : "member"}</span></div>
-               <span class="time">${fmtTime(time)}</span>
-             </div>
-             <div class="text">${escapeHtml(text)}</div>
-           </div>
-         </div>`;
-    els.messages.insertAdjacentHTML("beforeend", html);
-    els.messages.scrollTop = els.messages.scrollHeight;
-  }
-
-  function seedMessages() {
-    els.messages.innerHTML = "";
-    const ch = selectedChannel;
-    (systemMessages[ch] || ["Room loaded."]).forEach((msg, i) => {
-      addMessage({ name: "System", text: msg, time: Date.now() - (1000 * 60 * (3 - i)), kind: "system" });
-    });
-  }
-
-  function wsUrl() {
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    return `${proto}://${location.host}/ws/${selectedChannel}`;
-  }
-
-  function setConnState(text, ok=false) {
-    els.connState.textContent = text;
-    els.connState.style.color = ok ? "#d1ffe9" : "";
-  }
-
-  function connectSocket() {
-    if (socket) {
-      try { socket.close(); } catch {}
-    }
-    setConnState("connecting...");
-    seedMessages();
-
-    try {
-      socket = new WebSocket(wsUrl());
-    } catch (e) {
-      setConnState("offline");
-      return;
-    }
-
-    socket.onopen = () => setConnState("connected", true);
-    socket.onclose = () => {
-      setConnState("reconnecting...");
-      clearTimeout(reconnectTimer);
-      reconnectTimer = setTimeout(connectSocket, 1200);
-    };
-    socket.onerror = () => setConnState("connection error");
-    socket.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        if (data.kind === "system") {
-          addMessage({ ...data, kind: "system" });
-        } else {
-          addMessage({
-            name: data.name || "Guest",
-            text: data.text || "",
-            time: data.time || Date.now(),
-            kind: (data.client_id === localId) ? "self" : "member"
-          });
-        }
-      } catch {
-        addMessage({ name: "Guest", text: String(event.data), time: Date.now(), kind: "member" });
-      }
-    };
-  }
-
-  function sendMessage() {
-    const text = els.messageInput.value.trim();
-    if (!text || !socket || socket.readyState !== WebSocket.OPEN) return;
-    const payload = {
-      kind: "message",
-      client_id: localId,
-      name: displayName,
-      text,
-      channel: selectedChannel,
-      room: selectedServer,
-      time: Date.now()
-    };
-    socket.send(JSON.stringify(payload));
-    els.messageInput.value = "";
-    els.messageInput.focus();
+    els.channelTitle.textContent = ch ? ch.title : "# general";
+    els.channelDescription.textContent = ch ? ch.description : "A fast room for your crew.";
+    els.roomLabel.textContent = `#${selectedChannel}`;
+    document.title = `LinkUp — ${ch ? ch.title : "# general"}`;
   }
 
   function renderAll() {
@@ -636,6 +827,150 @@ def page_html() -> str:
     renderChannels();
     renderMembers();
     setHeader();
+    renderMessages(selectedChannel);
+  }
+
+  function wsUrl(roomId) {
+    const proto = location.protocol === "https:" ? "wss" : "ws";
+    return `${proto}://${location.host}/ws/${roomId}`;
+  }
+
+  function cleanupSocketTimers() {
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    if (handshakeTimer) {
+      clearTimeout(handshakeTimer);
+      handshakeTimer = null;
+    }
+  }
+
+  function connectSocket(force = false) {
+    cleanupSocketTimers();
+    const seq = ++connectionSeq;
+    const roomId = selectedChannel;
+    let opened = false;
+
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
+      try { socket.close(1000, "switching-room"); } catch {}
+    }
+
+    setStatus("connecting...");
+
+    try {
+      socket = new WebSocket(wsUrl(roomId));
+    } catch (err) {
+      setStatus("socket unavailable");
+      scheduleReconnect(seq);
+      return;
+    }
+
+    handshakeTimer = setTimeout(() => {
+      if (seq !== connectionSeq) return;
+      if (!opened) setStatus("connecting... still trying");
+    }, 4000);
+
+    socket.onopen = () => {
+      if (seq !== connectionSeq) {
+        try { socket.close(1000, "stale"); } catch {}
+        return;
+      }
+      opened = true;
+      retryCount = 0;
+      cleanupSocketTimers();
+      setStatus("connected", true);
+    };
+
+    socket.onmessage = (event) => {
+      if (seq !== connectionSeq) return;
+
+      let data = null;
+      try {
+        data = JSON.parse(event.data);
+      } catch {
+        data = {
+          kind: "message",
+          name: "Guest",
+          text: String(event.data),
+          time: Date.now()
+        };
+      }
+
+      if (!data) return;
+      data.time = data.time || Date.now();
+      data.client_id = data.client_id || "remote";
+      data.msg_id = data.msg_id || `srv_${roomId}_${data.time}_${Math.random().toString(36).slice(2, 8)}`;
+      data.kind = data.kind || "message";
+
+      addMessage(roomId, data, true);
+    };
+
+    socket.onerror = () => {
+      if (seq !== connectionSeq) return;
+      if (!opened) setStatus("connection error");
+    };
+
+    socket.onclose = () => {
+      if (seq !== connectionSeq) return;
+      cleanupSocketTimers();
+
+      const isIntentional = force && seq !== connectionSeq;
+      if (isIntentional) return;
+
+      if (opened) {
+        setStatus("disconnected");
+      } else {
+        setStatus("offline");
+      }
+
+      scheduleReconnect(seq);
+    };
+  }
+
+  function scheduleReconnect(seq) {
+    if (seq !== connectionSeq) return;
+    const delay = Math.min(1000 * Math.pow(2, retryCount), 10000);
+    retryCount += 1;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => {
+      if (seq !== connectionSeq) return;
+      connectSocket(false);
+    }, delay);
+
+    setTimeout(() => {
+      if (seq !== connectionSeq) return;
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        setStatus(`reconnecting in ${Math.ceil(delay / 1000)}s`);
+      }
+    }, 50);
+  }
+
+  function sendMessage() {
+    const text = els.messageInput.value.trim();
+    if (!text) return;
+
+    const payload = {
+      kind: "message",
+      msg_id: `cli_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+      client_id: localClientId,
+      name: displayName,
+      text,
+      room: selectedServer,
+      channel: selectedChannel,
+      time: Date.now()
+    };
+
+    // Optimistic local render so it never feels stuck.
+    addMessage(selectedChannel, payload, true);
+
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify(payload));
+    }
+
+    els.messageInput.value = "";
+    els.messageInput.style.height = "48px";
+    els.messageInput.focus();
   }
 
   els.nameInput.addEventListener("change", () => {
@@ -644,6 +979,7 @@ def page_html() -> str:
   });
 
   els.sendBtn.onclick = sendMessage;
+
   els.messageInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -651,8 +987,23 @@ def page_html() -> str:
     }
   });
 
+  els.messageInput.addEventListener("input", () => {
+    els.messageInput.style.height = "auto";
+    els.messageInput.style.height = Math.min(160, els.messageInput.scrollHeight) + "px";
+  });
+
+  window.addEventListener("online", () => {
+    setStatus("back online");
+    connectSocket(true);
+  });
+
+  window.addEventListener("offline", () => {
+    setStatus("offline");
+  });
+
   renderAll();
-  connectSocket();
+  ensureRoom(selectedChannel);
+  connectSocket(true);
 })();
 </script>
 </body>
@@ -672,3 +1023,9 @@ def health():
 @app.get("/api")
 def api_root():
     return {"message": "LinkUp API is live", "websocket": "/ws/{room_id}"}
+
+
+@app.get("/{path:path}", response_class=HTMLResponse)
+def spa_fallback(path: str):
+    # Keeps browser paths from showing a plain Not Found page while you are building.
+    return HTMLResponse(content=page_html())
