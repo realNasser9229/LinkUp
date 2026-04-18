@@ -13,9 +13,6 @@ from fastapi.responses import HTMLResponse
 
 app = FastAPI(title="LinkUp")
 
-# ----------------------------
-# CONFIG
-# ----------------------------
 
 class Settings:
     def __init__(self) -> None:
@@ -44,9 +41,6 @@ ROOM_META = [
 
 SEARCH_SUGGESTIONS = ["#python", "#games", "#art", "#music", "#ai", "#clips", "#buildinpublic"]
 
-# ----------------------------
-# HELPERS
-# ----------------------------
 
 def now_ms() -> int:
     return int(time.time() * 1000)
@@ -59,17 +53,6 @@ def uid(prefix: str) -> str:
 def clamp_text(value: str, length: int) -> str:
     value = (value or "").strip()
     return value[:length] if value else ""
-
-
-def escape_for_html(s: str) -> str:
-    return (
-        str(s)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&#39;")
-    )
 
 
 def serialize_profile(profile: dict) -> dict:
@@ -127,10 +110,6 @@ def serialize_message(msg: dict) -> dict:
     }
 
 
-# ----------------------------
-# FEED STATE
-# ----------------------------
-
 FEED: List[dict] = []
 FEED_INDEX: Dict[str, dict] = {}
 
@@ -184,10 +163,6 @@ def trending_posts() -> List[dict]:
     )
     return [serialize_post(p) for p in ranked[:8]]
 
-
-# ----------------------------
-# ROOM STATE
-# ----------------------------
 
 class RoomState:
     def __init__(self) -> None:
@@ -266,54 +241,9 @@ class RoomState:
         msg["reactions"] = {e: len(users) for e, users in self.reactions[room][msg_id].items()}
         return {"msg_id": msg_id, "reactions": msg["reactions"]}
 
-    async def broadcast_room(self, room: str, payload: dict) -> None:
-        dead = []
-        for cid, ws in self.sockets[room].items():
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                dead.append(cid)
-        for cid in dead:
-            self.remove(room, cid)
-
-    async def broadcast_all(self, payload: dict) -> None:
-        for room in list(self.sockets.keys()):
-            await self.broadcast_room(room, payload)
-
-    async def send_init(self, room: str, ws: WebSocket, client_id: str) -> None:
-        await ws.send_json(
-            {
-                "kind": "init",
-                "client_id": client_id,
-                "room": room,
-                "users": self.users(room),
-                "history": self.history_view(room),
-                "pins": self.pins_view(room),
-                "feed": [serialize_post(p) for p in FEED][-60:],
-                "feed_trending": trending_posts(),
-                "rooms": ROOM_META,
-                "suggestions": SEARCH_SUGGESTIONS,
-                "time": now_ms(),
-            }
-        )
-
-    async def send_presence(self, room: str) -> None:
-        await self.broadcast_room(
-            room,
-            {
-                "kind": "presence",
-                "room": room,
-                "users": self.users(room),
-                "time": now_ms(),
-            },
-        )
-
 
 ROOMS = RoomState()
 
-# ----------------------------
-# PROFILES
-# ----------------------------
 
 PROFILES: Dict[str, dict] = {}
 
@@ -331,9 +261,269 @@ def get_profile(client_id: str) -> dict:
     return PROFILES[client_id]
 
 
-# ----------------------------
-# WEBSOCKET
-# ----------------------------
+async def push_presence(room: str) -> None:
+    await ROOMS.broadcast_room(
+        room,
+        {
+            "kind": "presence",
+            "room": room,
+            "users": ROOMS.users(room),
+            "time": now_ms(),
+        },
+    )
+
+
+async def push_profile(profile: dict) -> None:
+    await ROOMS.broadcast_all(
+        {
+            "kind": "profile_update",
+            "profile": serialize_profile(profile),
+            "time": now_ms(),
+        }
+    )
+
+
+async def push_feed_update(post: dict) -> None:
+    await ROOMS.broadcast_all(
+        {
+            "kind": "feed_update",
+            "post": serialize_post(post),
+            "time": now_ms(),
+        }
+    )
+
+
+async def push_feed_post(post: dict) -> None:
+    await ROOMS.broadcast_all(
+        {
+            "kind": "feed_post",
+            "post": serialize_post(post),
+            "time": now_ms(),
+        }
+    )
+
+
+async def push_chat_message(room: str, msg: dict) -> None:
+    await ROOMS.broadcast_room(
+        room,
+        {
+            "kind": "chat_message",
+            "message": serialize_message(msg),
+        },
+    )
+
+
+async def push_pin_update(room: str, result: dict) -> None:
+    await ROOMS.broadcast_room(
+        room,
+        {
+            "kind": "pin_update",
+            **result,
+            "time": now_ms(),
+        },
+    )
+
+
+async def push_reaction_update(room: str, result: dict) -> None:
+    await ROOMS.broadcast_room(
+        room,
+        {
+            "kind": "reaction_update",
+            **result,
+            "time": now_ms(),
+        },
+    )
+
+
+async def push_typing(room: str, name: str, client_id: str) -> None:
+    await ROOMS.broadcast_room(
+        room,
+        {
+            "kind": "typing",
+            "client_id": client_id,
+            "name": name,
+            "time": now_ms(),
+        },
+    )
+
+
+async def push_system(room: str, text: str) -> None:
+    await ROOMS.broadcast_room(
+        room,
+        {
+            "kind": "system",
+            "msg_id": uid("sys"),
+            "name": "System",
+            "text": text,
+            "room": room,
+            "created_at": now_ms(),
+        },
+    )
+
+
+async def push_init(room: str, ws: WebSocket, client_id: str) -> None:
+    await ws.send_json(
+        {
+            "kind": "init",
+            "client_id": client_id,
+            "room": room,
+            "users": ROOMS.users(room),
+            "history": ROOMS.history_view(room),
+            "pins": ROOMS.pins_view(room),
+            "feed": [serialize_post(p) for p in FEED][-60:],
+            "feed_trending": trending_posts(),
+            "rooms": ROOM_META,
+            "suggestions": SEARCH_SUGGESTIONS,
+            "time": now_ms(),
+        }
+    )
+
+
+async def push_pong(ws: WebSocket) -> None:
+    await ws.send_json({"kind": "pong", "time": now_ms()})
+
+
+async def push_all_profile(profile: dict) -> None:
+    await ROOMS.broadcast_all(
+        {
+            "kind": "profile_update",
+            "profile": serialize_profile(profile),
+            "time": now_ms(),
+        }
+    )
+
+
+async def push_all_feed() -> None:
+    await ROOMS.broadcast_all(
+        {
+            "kind": "feed_snapshot",
+            "feed": [serialize_post(p) for p in FEED][-80:],
+            "feed_trending": trending_posts(),
+            "time": now_ms(),
+        }
+    )
+
+
+async def set_identity(room: str, client_id: str, name: str, avatar: str, bio: str, ws: WebSocket) -> dict:
+    profile = get_profile(client_id)
+    profile["name"] = clamp_text(name, 24) or "Guest"
+    profile["avatar"] = avatar.strip()
+    profile["bio"] = clamp_text(bio, 80)
+    ROOMS.register(room, profile, ws)
+    return profile
+
+
+async def handle_message(room: str, profile: dict, data: dict) -> None:
+    text = clamp_text(str(data.get("text") or ""), 5000)
+    if not text:
+        return
+
+    reply_to = data.get("reply_to")
+    reply_preview = None
+    if reply_to:
+        prev = ROOMS.find_message(room, str(reply_to))
+        if prev:
+            reply_preview = {
+                "msg_id": prev["msg_id"],
+                "name": prev.get("name", "Guest"),
+                "text": prev.get("text", "")[:120],
+            }
+
+    message = {
+        "msg_id": uid("msg"),
+        "client_id": profile["client_id"],
+        "name": profile["name"],
+        "avatar": profile["avatar"],
+        "text": text,
+        "room": room,
+        "created_at": now_ms(),
+        "reply_to": reply_to,
+        "reply_preview": reply_preview,
+        "reactions": {},
+        "pinned": False,
+    }
+    ROOMS.add_message(room, message)
+    await push_chat_message(room, message)
+
+
+async def handle_post(profile: dict, data: dict) -> None:
+    text = clamp_text(str(data.get("text") or ""), 5000)
+    media_url = str(data.get("media_url") or "").strip()
+    media_type = str(data.get("media_type") or "text").strip()
+
+    if not text and not media_url:
+        return
+
+    post = {
+        "id": uid("post"),
+        "client_id": profile["client_id"],
+        "name": profile["name"],
+        "avatar": profile["avatar"],
+        "bio": profile["bio"],
+        "text": text,
+        "media_url": media_url,
+        "media_type": media_type,
+        "created_at": now_ms(),
+        "likes": set(),
+        "reposts": set(),
+        "comments": [],
+    }
+    FEED.insert(0, post)
+    FEED_INDEX[post["id"]] = post
+    await push_feed_post(post)
+
+
+async def handle_feed_like(profile: dict, data: dict) -> None:
+    pid = str(data.get("post_id") or "")
+    post = FEED_INDEX.get(pid)
+    if not post:
+        return
+
+    likes = post["likes"]
+    if profile["client_id"] in likes:
+        likes.remove(profile["client_id"])
+    else:
+        likes.add(profile["client_id"])
+
+    await push_feed_update(post)
+
+
+async def handle_feed_repost(profile: dict, data: dict) -> None:
+    pid = str(data.get("post_id") or "")
+    post = FEED_INDEX.get(pid)
+    if not post:
+        return
+
+    reps = post["reposts"]
+    if profile["client_id"] in reps:
+        reps.remove(profile["client_id"])
+    else:
+        reps.add(profile["client_id"])
+
+    await push_feed_update(post)
+
+
+async def handle_feed_comment(profile: dict, data: dict) -> None:
+    pid = str(data.get("post_id") or "")
+    post = FEED_INDEX.get(pid)
+    if not post:
+        return
+
+    text = clamp_text(str(data.get("text") or ""), 1000)
+    if not text:
+        return
+
+    comment = {
+        "id": uid("c"),
+        "client_id": profile["client_id"],
+        "name": profile["name"],
+        "avatar": profile["avatar"],
+        "text": text,
+        "created_at": now_ms(),
+    }
+    post["comments"].append(comment)
+    await push_feed_update(post)
+
 
 @ws_router.websocket("/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):
@@ -343,9 +533,12 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
     profile = get_profile(client_id)
     active_room = room_id
 
+    ping_at = now_ms()
+
     try:
         while True:
             raw = await websocket.receive_text()
+            ping_at = now_ms()
 
             try:
                 data = json.loads(raw)
@@ -356,104 +549,58 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
 
             kind = str(data.get("kind") or "hello")
 
+            if kind == "ping":
+                await push_pong(websocket)
+                continue
+
             if kind == "hello":
                 client_id = str(data.get("client_id") or client_id)
-                profile = get_profile(client_id)
-                profile["name"] = clamp_text(str(data.get("name") or profile["name"]), 24) or "Guest"
-                profile["avatar"] = str(data.get("avatar") or profile.get("avatar") or "")
-                profile["bio"] = clamp_text(str(data.get("bio") or profile.get("bio") or ""), 80)
+                profile = await set_identity(
+                    active_room,
+                    client_id,
+                    str(data.get("name") or profile["name"]),
+                    str(data.get("avatar") or profile.get("avatar") or ""),
+                    str(data.get("bio") or profile.get("bio") or ""),
+                    websocket,
+                )
                 active_room = str(data.get("room") or room_id)
 
-                ROOMS.register(active_room, profile, websocket)
-                await ROOMS.send_init(active_room, websocket, client_id)
-                await ROOMS.send_presence(active_room)
-
-                await ROOMS.broadcast_all(
-                    {
-                        "kind": "profile_update",
-                        "profile": serialize_profile(profile),
-                        "time": now_ms(),
-                    }
-                )
+                await push_init(active_room, websocket, client_id)
+                await push_presence(active_room)
+                await push_profile(profile)
                 continue
 
             if kind == "profile":
                 old_name = profile["name"]
-                profile = get_profile(client_id)
-                profile["name"] = clamp_text(str(data.get("name") or profile["name"]), 24) or "Guest"
-                profile["avatar"] = str(data.get("avatar") or profile.get("avatar") or "")
-                profile["bio"] = clamp_text(str(data.get("bio") or profile.get("bio") or ""), 80)
+                profile = await set_identity(
+                    active_room,
+                    client_id,
+                    str(data.get("name") or profile["name"]),
+                    str(data.get("avatar") or profile.get("avatar") or ""),
+                    str(data.get("bio") or profile.get("bio") or ""),
+                    websocket,
+                )
+
+                await push_profile(profile)
 
                 if active_room:
-                    ROOMS.register(active_room, profile, websocket)
-                    await ROOMS.send_presence(active_room)
-
-                await ROOMS.broadcast_all(
-                    {
-                        "kind": "profile_update",
-                        "profile": serialize_profile(profile),
-                        "old_name": old_name,
-                        "time": now_ms(),
-                    }
-                )
+                    await push_presence(active_room)
+                    if old_name != profile["name"]:
+                        await push_system(active_room, f"{old_name} is now {profile['name']}")
                 continue
 
             if kind == "typing":
-                await ROOMS.broadcast_room(
-                    active_room,
-                    {
-                        "kind": "typing",
-                        "client_id": client_id,
-                        "name": profile["name"],
-                        "time": now_ms(),
-                    },
-                )
+                await push_typing(active_room, profile["name"], client_id)
                 continue
 
             if kind == "chat":
-                text = clamp_text(str(data.get("text") or ""), 5000)
-                if not text:
-                    continue
-
-                reply_to = data.get("reply_to")
-                reply_preview = None
-                if reply_to:
-                    prev = ROOMS.find_message(active_room, str(reply_to))
-                    if prev:
-                        reply_preview = {
-                            "msg_id": prev["msg_id"],
-                            "name": prev.get("name", "Guest"),
-                            "text": prev.get("text", "")[:120],
-                        }
-
-                message = {
-                    "msg_id": uid("msg"),
-                    "client_id": client_id,
-                    "name": profile["name"],
-                    "avatar": profile["avatar"],
-                    "text": text,
-                    "room": active_room,
-                    "created_at": now_ms(),
-                    "reply_to": reply_to,
-                    "reply_preview": reply_preview,
-                    "reactions": {},
-                    "pinned": False,
-                }
-                ROOMS.add_message(active_room, message)
-                await ROOMS.broadcast_room(active_room, {"kind": "chat_message", "message": serialize_message(message)})
+                await handle_message(active_room, profile, data)
                 continue
 
             if kind == "pin_chat":
                 result = ROOMS.toggle_pin(active_room, str(data.get("msg_id") or ""))
                 if result:
-                    await ROOMS.broadcast_room(
-                        active_room,
-                        {
-                            "kind": "pin_update",
-                            **result,
-                            "time": now_ms(),
-                        },
-                    )
+                    await push_pin_update(active_room, result)
                 continue
 
             if kind == "react_chat":
@@ -464,132 +611,72 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     client_id,
                 )
                 if result:
-                    await ROOMS.broadcast_room(
-                        active_room,
-                        {
-                            "kind": "reaction_update",
-                            **result,
-                            "time": now_ms(),
-                        },
-                    )
+                    await push_reaction_update(active_room, result)
                 continue
 
             if kind == "post":
-                text = clamp_text(str(data.get("text") or ""), 5000)
-                media_url = str(data.get("media_url") or "").strip()
-                media_type = str(data.get("media_type") or "text").strip()
-
-                if not text and not media_url:
-                    continue
-
-                post = {
-                    "id": uid("post"),
-                    "client_id": client_id,
-                    "name": profile["name"],
-                    "avatar": profile["avatar"],
-                    "bio": profile["bio"],
-                    "text": text,
-                    "media_url": media_url,
-                    "media_type": media_type,
-                    "created_at": now_ms(),
-                    "likes": set(),
-                    "reposts": set(),
-                    "comments": [],
-                }
-                FEED.insert(0, post)
-                FEED_INDEX[post["id"]] = post
-
-                await ROOMS.broadcast_all(
-                    {
-                        "kind": "feed_post",
-                        "post": serialize_post(post),
-                        "time": now_ms(),
-                    }
-                )
+                await handle_post(profile, data)
                 continue
 
             if kind == "feed_like":
-                pid = str(data.get("post_id") or "")
-                post = FEED_INDEX.get(pid)
-                if not post:
-                    continue
-                likes = post["likes"]
-                if client_id in likes:
-                    likes.remove(client_id)
-                else:
-                    likes.add(client_id)
-
-                await ROOMS.broadcast_all(
-                    {
-                        "kind": "feed_update",
-                        "post": serialize_post(post),
-                        "time": now_ms(),
-                    }
-                )
+                await handle_feed_like(profile, data)
                 continue
 
             if kind == "feed_repost":
-                pid = str(data.get("post_id") or "")
-                post = FEED_INDEX.get(pid)
-                if not post:
-                    continue
-                reps = post["reposts"]
-                if client_id in reps:
-                    reps.remove(client_id)
-                else:
-                    reps.add(client_id)
-
-                await ROOMS.broadcast_all(
-                    {
-                        "kind": "feed_update",
-                        "post": serialize_post(post),
-                        "time": now_ms(),
-                    }
-                )
+                await handle_feed_repost(profile, data)
                 continue
 
             if kind == "feed_comment":
-                pid = str(data.get("post_id") or "")
-                post = FEED_INDEX.get(pid)
-                if not post:
-                    continue
-
-                text = clamp_text(str(data.get("text") or ""), 1000)
-                if not text:
-                    continue
-
-                comment = {
-                    "id": uid("c"),
-                    "client_id": client_id,
-                    "name": profile["name"],
-                    "avatar": profile["avatar"],
-                    "text": text,
-                    "created_at": now_ms(),
-                }
-                post["comments"].append(comment)
-
-                await ROOMS.broadcast_all(
-                    {
-                        "kind": "feed_update",
-                        "post": serialize_post(post),
-                        "time": now_ms(),
-                    }
-                )
+                await handle_feed_comment(profile, data)
                 continue
 
     except WebSocketDisconnect:
         ROOMS.remove(active_room, client_id)
-        await ROOMS.send_presence(active_room)
+        await push_presence(active_room)
     except Exception:
         ROOMS.remove(active_room, client_id)
-        await ROOMS.send_presence(active_room)
+        await push_presence(active_room)
 
 
-app.include_router(ws_router)
+class SafeBroadcastMixin:
+    async def broadcast_room(self, room: str, payload: dict) -> None:
+        dead = []
+        for cid, ws in self.sockets[room].items():
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                dead.append(cid)
+        for cid in dead:
+            self.remove(room, cid)
 
-# ----------------------------
-# UI
-# ----------------------------
+    async def broadcast_all(self, payload: dict) -> None:
+        for room in list(self.sockets.keys()):
+            await self.broadcast_room(room, payload)
+
+
+RoomState.broadcast_room = SafeBroadcastMixin.broadcast_room
+RoomState.broadcast_all = SafeBroadcastMixin.broadcast_all
+
+
+@app.get("/", response_class=HTMLResponse)
+def root():
+    return HTMLResponse(page_html())
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "app": "LinkUp"}
+
+
+@app.get("/api")
+def api():
+    return {"message": "LinkUp is live", "websocket": "/ws/{room_id}"}
+
+
+@app.get("/{path:path}", response_class=HTMLResponse)
+def spa(path: str):
+    return HTMLResponse(page_html())
+
 
 def page_html() -> str:
     return """<!doctype html>
@@ -616,7 +703,7 @@ button,input,textarea,select{font:inherit}
 .app{
   height:100vh;
   display:grid;
-  grid-template-columns:72px 248px minmax(0,1fr) 280px;
+  grid-template-columns:72px 248px minmax(0,1fr) 300px;
   min-width:0;
 }
 .rail{
@@ -836,8 +923,8 @@ button,input,textarea,select{font:inherit}
 }
 .textarea{
   width:100%;
-  min-height:88px;
-  max-height:160px;
+  min-height:96px;
+  max-height:170px;
   overflow-y:auto;
   resize:none;
 }
@@ -1141,6 +1228,7 @@ button,input,textarea,select{font:inherit}
     reconnectTimer: null,
     typingTimer: null,
     replyTo: null,
+    connectedOnce: false,
     data: {
       feed: [],
       messages: [],
@@ -1182,17 +1270,6 @@ button,input,textarea,select{font:inherit}
 
   function setConn(text) {
     el("connState").textContent = text;
-  }
-
-  function profilePayload() {
-    return {
-      kind: "profile",
-      client_id: state.clientId,
-      name: state.name,
-      avatar: state.avatar,
-      bio: state.bio,
-      room: roomId(),
-    };
   }
 
   function send(kind, payload) {
@@ -1323,7 +1400,7 @@ button,input,textarea,select{font:inherit}
       `;
     }).join("");
     bindMessageActions();
-    el("statMessages")?.textContent = String(state.data.messages.length);
+    el("statMessages").textContent = String(state.data.messages.length);
   }
 
   function renderMembers() {
@@ -1401,6 +1478,7 @@ button,input,textarea,select{font:inherit}
 
   function connect() {
     const seq = ++state.seq;
+    state.connectedOnce = false;
 
     if (state.socket && (state.socket.readyState === WebSocket.OPEN || state.socket.readyState === WebSocket.CONNECTING)) {
       try { state.socket.close(1000, "switch"); } catch {}
@@ -1413,7 +1491,10 @@ button,input,textarea,select{font:inherit}
 
     state.socket.onopen = () => {
       if (seq !== state.seq) return;
+
+      state.connectedOnce = true;
       setConn("connected");
+
       state.socket.send(JSON.stringify({
         kind: "hello",
         client_id: state.clientId,
@@ -1422,11 +1503,28 @@ button,input,textarea,select{font:inherit}
         avatar: state.avatar,
         bio: state.bio,
       }));
+
+      state.reconnectTimer = setInterval(() => {
+        if (state.socket && state.socket.readyState === WebSocket.OPEN) {
+          state.socket.send(JSON.stringify({
+            kind: "ping",
+            client_id: state.clientId,
+            room: roomId(),
+            time: Date.now()
+          }));
+        }
+      }, 20000);
     };
 
     state.socket.onmessage = (e) => {
       if (seq !== state.seq) return;
+
       const data = JSON.parse(e.data);
+
+      if (data.kind === "pong") {
+        if (state.connectedOnce) setConn("connected");
+        return;
+      }
 
       if (data.kind === "init") {
         state.data.users = data.users || [];
@@ -1435,6 +1533,7 @@ button,input,textarea,select{font:inherit}
         state.data.feed = data.feed || [];
         state.data.trending = data.feed_trending || [];
         renderAll();
+        if (state.connectedOnce) setConn("connected");
         return;
       }
 
@@ -1492,10 +1591,38 @@ button,input,textarea,select{font:inherit}
         return;
       }
 
+      if (data.kind === "feed_snapshot") {
+        state.data.feed = data.feed || state.data.feed;
+        state.data.trending = data.feed_trending || state.data.trending;
+        renderFeed();
+        renderTrending();
+        return;
+      }
+
       if (data.kind === "typing") {
-        el("channelDescription").textContent = `${data.name || "Someone"} is typing...`;
+        const desc = currentRoomName() + " • " + (data.name || "Someone") + " is typing...";
+        el("channelDescription").textContent = desc;
         clearTimeout(state.typingTimer);
         state.typingTimer = setTimeout(renderTop, 900);
+        return;
+      }
+
+      if (data.kind === "system") {
+        state.data.messages.push({
+          msg_id: data.msg_id,
+          client_id: "system",
+          name: "System",
+          avatar: "",
+          text: data.text,
+          room: roomId(),
+          created_at: data.created_at || Date.now(),
+          reply_to: null,
+          reply_preview: null,
+          reactions: {},
+          pinned: false,
+        });
+        renderMessages();
+        return;
       }
     };
 
@@ -1506,7 +1633,8 @@ button,input,textarea,select{font:inherit}
 
     state.socket.onclose = () => {
       if (seq !== state.seq) return;
-      setConn("offline");
+      clearInterval(state.reconnectTimer);
+      setConn(state.connectedOnce ? "disconnected" : "offline");
       state.reconnectTimer = setTimeout(() => connect(), 1200);
     };
   }
@@ -1525,10 +1653,7 @@ button,input,textarea,select{font:inherit}
           return;
         }
 
-        if (act === "pin") {
-          return send("pin_chat", { msg_id: id });
-        }
-
+        if (act === "pin") return send("pin_chat", { msg_id: id });
         if (act === "react") {
           const emoji = prompt("Reaction", "👍");
           if (emoji) send("react_chat", { msg_id: id, emoji });
@@ -1542,7 +1667,6 @@ button,input,textarea,select{font:inherit}
       btn.onclick = () => {
         const id = btn.dataset.id;
         const act = btn.dataset.pact;
-
         if (act === "like") return send("feed_like", { post_id: id });
         if (act === "repost") return send("feed_repost", { post_id: id });
         if (act === "comment") {
@@ -1628,27 +1752,8 @@ button,input,textarea,select{font:inherit}
 })();
 </script>
 </body>
-</html>"""
-
-
-@app.get("/", response_class=HTMLResponse)
-def root():
-    return HTMLResponse(page_html())
-
-
-@app.get("/health")
-def health():
-    return {"ok": True, "app": "LinkUp"}
-
-
-@app.get("/api")
-def api():
-    return {"message": "LinkUp is live", "websocket": "/ws/{room_id}"}
-
-
-@app.get("/{path:path}")
-def spa(path: str):
-    return HTMLResponse(page_html())
+</html>
+"""
 
 
 
