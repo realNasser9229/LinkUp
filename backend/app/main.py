@@ -114,7 +114,7 @@ def serialize_message(msg: dict) -> dict:
 
 
 # ----------------------------
-# Global feed state
+# Feed
 # ----------------------------
 
 FEED: List[dict] = []
@@ -419,11 +419,12 @@ async def push_pong(ws: WebSocket) -> None:
 # Action handlers
 # ----------------------------
 
-async def set_identity(room: str, client_id: str, name: str, avatar: str, bio: str, ws: WebSocket) -> dict:
+async def set_identity(room: str, client_id: str, name: str, avatar: str, bio: str, accent: str, ws: WebSocket) -> dict:
     profile = get_profile(client_id)
     profile["name"] = clamp_text(name, 24) or "Guest"
     profile["avatar"] = avatar.strip()
     profile["bio"] = clamp_text(bio, 80)
+    profile["accent"] = clamp_text(accent, 20) or "#5865f2"
     ROOMS.register(room, profile, ws)
     return profile
 
@@ -445,13 +446,13 @@ async def handle_message(room: str, profile: dict, data: dict) -> None:
             }
 
     message = {
-        "msg_id": uid("msg"),
+        "msg_id": str(data.get("msg_id") or uid("msg")),
         "client_id": profile["client_id"],
         "name": profile["name"],
         "avatar": profile["avatar"],
         "text": text,
         "room": room,
-        "created_at": now_ms(),
+        "created_at": int(data.get("created_at") or now_ms()),
         "reply_to": reply_to,
         "reply_preview": reply_preview,
         "reactions": {},
@@ -470,7 +471,7 @@ async def handle_post(profile: dict, data: dict) -> None:
         return
 
     post = {
-        "id": uid("post"),
+        "id": str(data.get("id") or uid("post")),
         "client_id": profile["client_id"],
         "name": profile["name"],
         "avatar": profile["avatar"],
@@ -478,11 +479,12 @@ async def handle_post(profile: dict, data: dict) -> None:
         "text": text,
         "media_url": media_url,
         "media_type": media_type,
-        "created_at": now_ms(),
+        "created_at": int(data.get("created_at") or now_ms()),
         "likes": set(),
         "reposts": set(),
         "comments": [],
     }
+
     FEED.insert(0, post)
     FEED_INDEX[post["id"]] = post
     await push_feed_post(post)
@@ -551,7 +553,6 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
     client_id = "cli_" + uuid4().hex[:10]
     profile = get_profile(client_id)
     active_room = room_id
-    connected = False
 
     try:
         while True:
@@ -578,12 +579,11 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     str(data.get("name") or profile["name"]),
                     str(data.get("avatar") or profile.get("avatar") or ""),
                     str(data.get("bio") or profile.get("bio") or ""),
+                    str(data.get("accent") or profile.get("accent") or "#5865f2"),
                     websocket,
                 )
-                active_room = str(data.get("room") or room_id)
 
-                if not connected:
-                    connected = True
+                active_room = str(data.get("room") or room_id)
 
                 await push_init(active_room, websocket, client_id)
                 await push_presence(active_room)
@@ -598,10 +598,13 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     str(data.get("name") or profile["name"]),
                     str(data.get("avatar") or profile.get("avatar") or ""),
                     str(data.get("bio") or profile.get("bio") or ""),
+                    str(data.get("accent") or profile.get("accent") or "#5865f2"),
                     websocket,
                 )
+
                 await push_profile(profile)
                 await push_presence(active_room)
+
                 if old_name != profile["name"]:
                     await push_system(active_room, f"{old_name} is now {profile['name']}")
                 continue
@@ -685,7 +688,7 @@ def spa(path: str):
 
 def page_html() -> str:
     return """<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -693,13 +696,31 @@ def page_html() -> str:
 <style>
 :root{
   --bg:#313338;
+  --bg-soft:#37393f;
   --panel:#2b2d31;
   --panel2:#1e1f22;
+  --panel3:#222327;
   --text:#f2f3f5;
   --muted:#b5bac1;
   --accent:#5865f2;
-  --accent2:#3ba55d;
+  --accent-2:#3ba55d;
+  --danger:#ed4245;
   --line:rgba(255,255,255,.06);
+  --shadow:0 10px 28px rgba(0,0,0,.25);
+}
+html[data-theme="light"]{
+  --bg:#f4f6fb;
+  --bg-soft:#ffffff;
+  --panel:#ffffff;
+  --panel2:#edf1f7;
+  --panel3:#f6f8fb;
+  --text:#111827;
+  --muted:#5b6475;
+  --accent:#5865f2;
+  --accent-2:#1b9b58;
+  --danger:#dc2626;
+  --line:rgba(17,24,39,.10);
+  --shadow:0 10px 28px rgba(17,24,39,.10);
 }
 *{box-sizing:border-box}
 html,body{height:100%}
@@ -714,7 +735,7 @@ button,input,textarea,select{font:inherit}
 .app{
   height:100vh;
   display:grid;
-  grid-template-columns:72px 248px minmax(0,1fr) 300px;
+  grid-template-columns:72px 248px minmax(0,1fr) 320px;
   min-width:0;
 }
 .rail{
@@ -734,7 +755,7 @@ button,input,textarea,select{font:inherit}
   height:48px;
   border:none;
   border-radius:16px;
-  background:#383a40;
+  background:#40444b;
   color:#fff;
   font-weight:800;
   cursor:pointer;
@@ -775,7 +796,7 @@ button,input,textarea,select{font:inherit}
   margin-top:10px;
   padding:6px 10px;
   border-radius:999px;
-  background:rgba(255,255,255,.04);
+  background:rgba(255,255,255,.05);
   color:var(--muted);
   font-size:12px;
 }
@@ -784,9 +805,7 @@ button,input,textarea,select{font:inherit}
   overflow-y:auto;
   flex:1;
 }
-.section{
-  padding:10px 8px 8px;
-}
+.section{padding:10px 8px 8px}
 .sectiontitle{
   margin:6px 8px 10px;
   color:#969aa3;
@@ -802,7 +821,7 @@ button,input,textarea,select{font:inherit}
   padding:10px;
   margin-bottom:2px;
   background:transparent;
-  color:#fff;
+  color:var(--text);
   display:flex;
   justify-content:space-between;
   gap:10px;
@@ -839,13 +858,13 @@ button,input,textarea,select{font:inherit}
   overflow:hidden;
 }
 .topbar{
-  height:50px;
+  height:56px;
   display:flex;
   align-items:center;
   justify-content:space-between;
   padding:0 16px;
   border-bottom:1px solid var(--line);
-  background:rgba(49,51,56,.95);
+  background:var(--bg-soft);
 }
 .titleblock{
   display:flex;
@@ -861,7 +880,7 @@ button,input,textarea,select{font:inherit}
   white-space:nowrap;
   overflow:hidden;
   text-overflow:ellipsis;
-  max-width:40vw;
+  max-width:38vw;
 }
 .conn{
   display:flex;
@@ -875,18 +894,15 @@ button,input,textarea,select{font:inherit}
   width:10px;
   height:10px;
   border-radius:999px;
-  background:var(--accent2);
-  box-shadow:0 0 0 4px rgba(59,165,93,.1);
+  background:var(--accent-2);
+  box-shadow:0 0 0 4px rgba(59,165,93,.10);
 }
 .toolbar{
   display:flex;
   gap:10px;
   align-items:center;
 }
-.tabs{
-  display:flex;
-  gap:8px;
-}
+.tabs{display:flex;gap:8px}
 .tab{
   border:none;
   background:#40444b;
@@ -902,8 +918,8 @@ button,input,textarea,select{font:inherit}
   padding:9px 12px;
   border:none;
   border-radius:8px;
-  background:#1e1f22;
-  color:#fff;
+  background:var(--panel2);
+  color:var(--text);
   outline:none;
 }
 .content{
@@ -916,10 +932,11 @@ button,input,textarea,select{font:inherit}
 .pane.active{display:block}
 .box{
   padding:14px;
-  border-radius:10px;
-  background:#2b2d31;
+  border-radius:12px;
+  background:var(--panel);
   border:1px solid var(--line);
   margin-bottom:12px;
+  box-shadow:var(--shadow);
 }
 .label{
   color:var(--muted);
@@ -930,9 +947,9 @@ button,input,textarea,select{font:inherit}
 .input,.textarea,select{
   border:none;
   outline:none;
-  background:#1e1f22;
-  color:#fff;
-  border-radius:8px;
+  background:var(--panel2);
+  color:var(--text);
+  border-radius:10px;
   padding:10px 12px;
 }
 .textarea{
@@ -948,7 +965,7 @@ button,input,textarea,select{font:inherit}
   border:none;
   background:var(--accent);
   color:#fff;
-  border-radius:8px;
+  border-radius:10px;
   padding:10px 14px;
   cursor:pointer;
   font-weight:700;
@@ -957,16 +974,17 @@ button,input,textarea,select{font:inherit}
   border:none;
   background:#40444b;
   color:#fff;
-  border-radius:8px;
+  border-radius:10px;
   padding:10px 14px;
   cursor:pointer;
 }
 .post,.msgbox{
   padding:14px;
-  border-radius:10px;
-  background:#2b2d31;
+  border-radius:12px;
+  background:var(--panel);
   border:1px solid var(--line);
   margin-bottom:10px;
+  box-shadow:var(--shadow);
 }
 .posthead,.msghead{
   display:flex;
@@ -1009,7 +1027,7 @@ button,input,textarea,select{font:inherit}
 }
 .media{
   margin-top:12px;
-  border-radius:10px;
+  border-radius:12px;
   overflow:hidden;
   background:#111;
 }
@@ -1054,7 +1072,7 @@ button,input,textarea,select{font:inherit}
   gap:8px;
   align-items:flex-start;
   padding:10px;
-  border-radius:8px;
+  border-radius:10px;
 }
 .user:hover{background:rgba(255,255,255,.04)}
 .user .left{min-width:0}
@@ -1086,6 +1104,19 @@ button,input,textarea,select{font:inherit}
   color:var(--muted);
   font-size:12px;
   line-height:1.6;
+}
+.settingrow{
+  display:flex;
+  gap:10px;
+  flex-wrap:wrap;
+  margin-top:8px;
+}
+.toggle{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  font-size:12px;
+  color:var(--muted);
 }
 @media (max-width:1100px){
   .app{grid-template-columns:72px 240px minmax(0,1fr)}
@@ -1180,19 +1211,28 @@ button,input,textarea,select{font:inherit}
     <div class="head">
       <div class="brand">
         <div>
-          <h1>Your profile</h1>
-          <small>change it anytime</small>
+          <h1>Settings</h1>
+          <small>edit anytime</small>
         </div>
       </div>
     </div>
     <div class="scroll">
       <div class="section">
-        <div class="label">Profile</div>
+        <div class="label">Your profile</div>
         <div class="box">
           <input id="nameInput" class="input" placeholder="Username">
           <input id="avatarInput" class="input" placeholder="Avatar URL" style="margin-top:8px">
           <textarea id="bioInput" class="textarea" placeholder="Bio" style="min-height:70px;margin-top:8px"></textarea>
-          <button class="primary" id="profileBtn" style="margin-top:8px">Save profile</button>
+
+          <div class="settingrow">
+            <select id="themeInput" class="select">
+              <option value="dark">Dark</option>
+              <option value="light">Light</option>
+            </select>
+            <input id="accentInput" class="input" type="color" style="max-width:90px;padding:6px 8px;">
+          </div>
+
+          <button class="primary" id="profileBtn" style="margin-top:10px;width:100%">Save profile</button>
         </div>
       </div>
 
@@ -1212,7 +1252,7 @@ button,input,textarea,select{font:inherit}
       </div>
 
       <div class="smallnote">
-        Users can change username and avatar anytime. No hard lock, no nonsense.
+        Username, avatar, bio, accent, and theme can all be changed anytime. That part is fixed now.
       </div>
     </div>
   </aside>
@@ -1237,10 +1277,12 @@ button,input,textarea,select{font:inherit}
     name: localStorage.getItem("linkup_name") || "You",
     avatar: localStorage.getItem("linkup_avatar") || "",
     bio: localStorage.getItem("linkup_bio") || "",
+    accent: localStorage.getItem("linkup_accent") || "#5865f2",
+    theme: localStorage.getItem("linkup_theme") || "dark",
     socket: null,
     seq: 0,
-    reconnectTimer: null,
     typingTimer: null,
+    reconnectTimer: null,
     replyTo: null,
     connectedOnce: false,
     data: {
@@ -1261,6 +1303,11 @@ button,input,textarea,select{font:inherit}
   const membersList = el("members");
   const pinsList = el("pins");
   const trendingList = el("trending");
+
+  function applyTheme() {
+    document.documentElement.setAttribute("data-theme", state.theme === "light" ? "light" : "dark");
+    document.documentElement.style.setProperty("--accent", state.accent || "#5865f2");
+  }
 
   function esc(s) {
     return String(s ?? "").replace(/[&<>"']/g, (m) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[m]));
@@ -1347,9 +1394,9 @@ button,input,textarea,select{font:inherit}
   function renderFeed() {
     feedList.innerHTML = feedFiltered().map((p) => {
       const comments = (p.comments || []).slice(-3).map((c) => `
-        <div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:#1e1f22">
+        <div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:var(--panel2)">
           <b style="font-size:13px">${esc(c.name)}</b>
-          <div style="color:#b5bac1;font-size:12px;margin-top:2px">${esc(c.text)}</div>
+          <div style="color:var(--muted);font-size:12px;margin-top:2px">${esc(c.text)}</div>
         </div>
       `).join("");
 
@@ -1453,10 +1500,12 @@ button,input,textarea,select{font:inherit}
     `).join("") || `<div class="smallnote">Nothing trending yet.</div>`;
   }
 
-  function renderProfileFields() {
+  function renderSettingsFields() {
     el("nameInput").value = state.name;
     el("avatarInput").value = state.avatar;
     el("bioInput").value = state.bio;
+    el("themeInput").value = state.theme;
+    el("accentInput").value = state.accent;
   }
 
   function renderTop() {
@@ -1477,11 +1526,12 @@ button,input,textarea,select{font:inherit}
   }
 
   function renderAll() {
+    applyTheme();
     renderServers();
     renderChannels();
     renderTop();
     renderTabs();
-    renderProfileFields();
+    renderSettingsFields();
     renderFeed();
     renderMessages();
     renderMembers();
@@ -1525,6 +1575,7 @@ button,input,textarea,select{font:inherit}
         name: state.name,
         avatar: state.avatar,
         bio: state.bio,
+        accent: state.accent,
       }));
 
       state.socket.send(JSON.stringify({
@@ -1567,6 +1618,20 @@ button,input,textarea,select{font:inherit}
         const idx = (state.data.users || []).findIndex((u) => u.client_id === p.client_id);
         if (idx >= 0) state.data.users[idx] = p;
         else state.data.users = [...(state.data.users || []), p];
+
+        if (p.client_id === state.clientId) {
+          state.name = p.name || state.name;
+          state.avatar = p.avatar || state.avatar;
+          state.bio = p.bio || state.bio;
+          state.accent = p.accent || state.accent;
+          localStorage.setItem("linkup_name", state.name);
+          localStorage.setItem("linkup_avatar", state.avatar);
+          localStorage.setItem("linkup_bio", state.bio);
+          localStorage.setItem("linkup_accent", state.accent);
+          renderSettingsFields();
+          applyTheme();
+        }
+
         renderMembers();
         renderTrending();
         return;
@@ -1703,13 +1768,18 @@ button,input,textarea,select{font:inherit}
     state.name = (el("nameInput").value || "You").trim().slice(0, 24) || "You";
     state.avatar = (el("avatarInput").value || "").trim();
     state.bio = (el("bioInput").value || "").trim().slice(0, 80);
+    state.theme = el("themeInput").value === "light" ? "light" : "dark";
+    state.accent = el("accentInput").value || "#5865f2";
 
     localStorage.setItem("linkup_name", state.name);
     localStorage.setItem("linkup_avatar", state.avatar);
     localStorage.setItem("linkup_bio", state.bio);
+    localStorage.setItem("linkup_theme", state.theme);
+    localStorage.setItem("linkup_accent", state.accent);
 
-    send("profile", { name: state.name, avatar: state.avatar, bio: state.bio });
-    renderProfileFields();
+    applyTheme();
+    send("profile", { name: state.name, avatar: state.avatar, bio: state.bio, accent: state.accent });
+    renderSettingsFields();
   };
 
   el("postBtn").onclick = () => {
@@ -1735,7 +1805,7 @@ button,input,textarea,select{font:inherit}
     };
 
     optimisticAddPost(post);
-    send("post", { text, media_url, media_type });
+    send("post", { id: post.id, text, media_url, media_type, created_at: post.created_at });
 
     el("postText").value = "";
     el("mediaUrl").value = "";
@@ -1761,7 +1831,7 @@ button,input,textarea,select{font:inherit}
     };
 
     optimisticAddChat(msg);
-    send("chat", { text, reply_to: state.replyTo });
+    send("chat", { text, reply_to: state.replyTo, msg_id: msg.msg_id, created_at: msg.created_at });
 
     state.replyTo = null;
     el("messageInput").placeholder = "Message LinkUp...";
