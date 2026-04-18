@@ -1,4 +1,4 @@
-from __future__ import annotations
+ffrom __future__ import annotations
 
 import json
 import os
@@ -781,6 +781,7 @@ button,input,textarea,select{font:inherit}
   padding:16px;
   border-bottom:1px solid var(--line);
   flex:0 0 auto;
+  position:relative;
 }
 .brand{
   display:flex;
@@ -865,6 +866,7 @@ button,input,textarea,select{font:inherit}
   padding:0 16px;
   border-bottom:1px solid var(--line);
   background:var(--bg-soft);
+  gap:12px;
 }
 .titleblock{
   display:flex;
@@ -901,8 +903,9 @@ button,input,textarea,select{font:inherit}
   display:flex;
   gap:10px;
   align-items:center;
+  min-width:0;
 }
-.tabs{display:flex;gap:8px}
+.tabs{display:flex;gap:8px;flex:0 0 auto}
 .tab{
   border:none;
   background:#40444b;
@@ -913,8 +916,7 @@ button,input,textarea,select{font:inherit}
 }
 .tab.active{background:var(--accent)}
 .search{
-  width:260px;
-  max-width:30vw;
+  width:min(260px, 30vw);
   padding:9px 12px;
   border:none;
   border-radius:8px;
@@ -1111,12 +1113,14 @@ button,input,textarea,select{font:inherit}
   flex-wrap:wrap;
   margin-top:8px;
 }
-.toggle{
-  display:flex;
-  align-items:center;
-  gap:8px;
-  font-size:12px;
-  color:var(--muted);
+.mobilebar{
+  display:none;
+}
+.overlay{
+  display:none;
+}
+.sheetclose{
+  display:none;
 }
 @media (max-width:1100px){
   .app{grid-template-columns:72px 240px minmax(0,1fr)}
@@ -1124,23 +1128,185 @@ button,input,textarea,select{font:inherit}
   .search{width:180px;max-width:35vw}
 }
 @media (max-width:820px){
-  body{overflow:auto}
+  body{
+    overflow:hidden;
+  }
+
   .app{
-    height:auto;
+    height:100vh;
     min-height:100vh;
     grid-template-columns:1fr;
+    grid-template-rows: 56px 1fr 64px;
   }
-  .sidebar,.rightbar{display:none}
-  .main{min-height:100vh}
-  .search{display:none}
+
+  .sidebar,
+  .rightbar{
+    display:flex;
+    position:fixed;
+    inset:0 0 auto 0;
+    height:100vh;
+    width:100vw;
+    z-index:40;
+    transform:translateY(100%);
+    transition:transform .22s ease;
+    border:none;
+  }
+
+  .sidebar.open,
+  .rightbar.open{
+    transform:translateY(0);
+  }
+
+  .overlay{
+    display:block;
+    position:fixed;
+    inset:0;
+    background:rgba(0,0,0,.55);
+    opacity:0;
+    pointer-events:none;
+    transition:opacity .2s ease;
+    z-index:35;
+  }
+
+  .overlay.open{
+    opacity:1;
+    pointer-events:auto;
+  }
+
+  .sheetclose{
+    display:grid;
+    place-items:center;
+    position:absolute;
+    top:12px;
+    right:12px;
+    width:40px;
+    height:40px;
+    border:none;
+    border-radius:12px;
+    background:var(--panel2);
+    color:var(--text);
+    cursor:pointer;
+    z-index:50;
+  }
+
+  .main{
+    min-height:0;
+    overflow:hidden;
+  }
+
+  .topbar{
+    height:auto;
+    min-height:56px;
+    padding:10px 12px;
+    gap:10px;
+    flex-wrap:wrap;
+  }
+
+  .titleblock{
+    width:100%;
+    gap:8px;
+    justify-content:space-between;
+  }
+
+  .titleblock p{
+    max-width:100%;
+  }
+
+  .toolbar{
+    width:100%;
+    justify-content:space-between;
+    flex-wrap:wrap;
+  }
+
+  .tabs{
+    display:flex;
+    order:1;
+  }
+
+  .search{
+    width:100%;
+    max-width:none;
+    order:3;
+  }
+
+  .conn{
+    order:2;
+  }
+
+  .content{
+    padding:10px;
+  }
+
+  .box{
+    border-radius:16px;
+  }
+
+  .textarea{
+    min-height:88px;
+    max-height:140px;
+  }
+
+  .messages,
+  #feedList,
+  #messages{
+    padding-bottom:88px;
+  }
+
+  .mobilebar{
+    display:flex;
+    position:fixed;
+    left:0;
+    right:0;
+    bottom:0;
+    height:64px;
+    background:var(--panel);
+    border-top:1px solid var(--line);
+    z-index:50;
+    padding:8px;
+    gap:8px;
+  }
+
+  .mobbtn{
+    flex:1;
+    border:none;
+    border-radius:14px;
+    background:var(--panel2);
+    color:var(--text);
+    font-weight:700;
+    cursor:pointer;
+  }
+
+  .mobbtn.active{
+    background:var(--accent);
+    color:#fff;
+  }
+
+  .channels-btn,
+  .settings-btn{
+    width:40px;
+    flex:0 0 auto;
+  }
+
+  .tabs{
+    display:none;
+  }
+
+  .sidebar .scroll,
+  .rightbar .scroll{
+    overflow-y:auto;
+    height:calc(100vh - 72px);
+  }
 }
 </style>
 </head>
 <body>
+<div class="overlay" id="overlay"></div>
+
 <div class="app">
   <aside class="rail serverrail" id="servers"></aside>
 
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
+    <button class="sheetclose" id="closeSidebarBtn">✕</button>
     <div class="head">
       <div class="brand">
         <div>
@@ -1165,13 +1331,21 @@ button,input,textarea,select{font:inherit}
         <h2 id="channelTitle"># general</h2>
         <p id="channelDescription">A flatter, cleaner room for chat and posts.</p>
       </div>
+
       <div class="toolbar">
         <div class="tabs">
           <button class="tab active" data-tab="feed">Feed</button>
           <button class="tab" data-tab="chat">Chat</button>
         </div>
+
         <input id="searchInput" class="search" placeholder="Search feed or chat...">
+
         <div class="conn"><span class="dot"></span><span id="connState">connecting...</span></div>
+
+        <div class="mobiletop">
+          <button class="iconbtn" id="openChannelsBtn" title="Channels">☰</button>
+          <button class="iconbtn" id="openSettingsBtn" title="Settings">⚙</button>
+        </div>
       </div>
     </div>
 
@@ -1207,7 +1381,8 @@ button,input,textarea,select{font:inherit}
     </div>
   </main>
 
-  <aside class="rightbar">
+  <aside class="rightbar" id="rightbar">
+    <button class="sheetclose" id="closeRightBtn">✕</button>
     <div class="head">
       <div class="brand">
         <div>
@@ -1216,8 +1391,9 @@ button,input,textarea,select{font:inherit}
         </div>
       </div>
     </div>
+
     <div class="scroll">
-      <div class="section">
+      <div class="section" id="profileSection">
         <div class="label">Your profile</div>
         <div class="box">
           <input id="nameInput" class="input" placeholder="Username">
@@ -1236,26 +1412,34 @@ button,input,textarea,select{font:inherit}
         </div>
       </div>
 
-      <div class="section">
+      <div class="section" id="peopleSection">
         <div class="label">Online now</div>
         <div id="members" class="list"></div>
       </div>
 
-      <div class="section">
+      <div class="section" id="pinsSection">
         <div class="label">Pinned messages</div>
         <div id="pins" class="pills"></div>
       </div>
 
-      <div class="section">
+      <div class="section" id="trendingSection">
         <div class="label">Trending posts</div>
         <div id="trending" class="list"></div>
       </div>
 
       <div class="smallnote">
-        Username, avatar, bio, accent, and theme can all be changed anytime. That part is fixed now.
+        Username, avatar, bio, accent, and theme can all be changed anytime.
       </div>
     </div>
   </aside>
+</div>
+
+<div class="mobilebar">
+  <button class="mobbtn active" id="mobFeedBtn">Feed</button>
+  <button class="mobbtn" id="mobChatBtn">Chat</button>
+  <button class="mobbtn channels-btn" id="mobChannelsBtn">☰</button>
+  <button class="mobbtn" id="mobPeopleBtn">People</button>
+  <button class="mobbtn settings-btn" id="mobSettingsBtn">⚙</button>
 </div>
 
 <script>
@@ -1303,6 +1487,9 @@ button,input,textarea,select{font:inherit}
   const membersList = el("members");
   const pinsList = el("pins");
   const trendingList = el("trending");
+  const sidebar = el("sidebar");
+  const rightbar = el("rightbar");
+  const overlay = el("overlay");
 
   function applyTheme() {
     document.documentElement.setAttribute("data-theme", state.theme === "light" ? "light" : "dark");
@@ -1357,6 +1544,7 @@ button,input,textarea,select{font:inherit}
         localStorage.setItem("linkup_channel", state.channel);
         renderAll();
         connect();
+        closeDrawers();
       };
     });
   }
@@ -1377,6 +1565,7 @@ button,input,textarea,select{font:inherit}
         localStorage.setItem("linkup_channel", state.channel);
         renderAll();
         connect();
+        closeDrawers();
       };
     });
   }
@@ -1523,6 +1712,9 @@ button,input,textarea,select{font:inherit}
     });
     el("feedPane").classList.toggle("active", state.tab === "feed");
     el("chatPane").classList.toggle("active", state.tab === "chat");
+
+    document.getElementById("mobFeedBtn").classList.toggle("active", state.tab === "feed");
+    document.getElementById("mobChatBtn").classList.toggle("active", state.tab === "chat");
   }
 
   function renderAll() {
@@ -1548,6 +1740,34 @@ button,input,textarea,select{font:inherit}
     state.data.feed.unshift(post);
     renderFeed();
     renderTrending();
+  }
+
+  function openDrawer(which) {
+    if (which === "channels") {
+      sidebar.classList.add("open");
+      rightbar.classList.remove("open");
+      overlay.classList.add("open");
+    } else if (which === "settings") {
+      rightbar.classList.add("open");
+      sidebar.classList.remove("open");
+      overlay.classList.add("open");
+    } else {
+      closeDrawers();
+    }
+  }
+
+  function closeDrawers() {
+    sidebar.classList.remove("open");
+    rightbar.classList.remove("open");
+    overlay.classList.remove("open");
+  }
+
+  function focusRightSection(sectionId) {
+    openDrawer("settings");
+    setTimeout(() => {
+      const node = document.getElementById(sectionId);
+      if (node) node.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 50);
   }
 
   function connect() {
@@ -1865,6 +2085,21 @@ button,input,textarea,select{font:inherit}
 
   el("messageInput").addEventListener("input", () => {
     send("typing", {});
+  });
+
+  document.getElementById("mobFeedBtn").onclick = () => state.tab = "feed";
+  document.getElementById("mobChatBtn").onclick = () => state.tab = "chat";
+  document.getElementById("mobChannelsBtn").onclick = () => openDrawer("channels");
+  document.getElementById("mobSettingsBtn").onclick = () => openDrawer("settings");
+  document.getElementById("mobPeopleBtn").onclick = () => focusRightSection("peopleSection");
+  document.getElementById("openChannelsBtn").onclick = () => openDrawer("channels");
+  document.getElementById("openSettingsBtn").onclick = () => openDrawer("settings");
+  document.getElementById("closeSidebarBtn").onclick = closeDrawers;
+  document.getElementById("closeRightBtn").onclick = closeDrawers;
+  overlay.onclick = closeDrawers;
+
+  window.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") closeDrawers();
   });
 
   window.addEventListener("beforeunload", () => {
