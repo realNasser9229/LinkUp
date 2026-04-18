@@ -1,911 +1,1654 @@
-from future import annotations
+from __future__ import annotations
 
-import json import os import time from collections import defaultdict, deque from dataclasses import dataclass, asdict from typing import Deque, Dict, List, Optional, Set from uuid import uuid4
+import json
+import os
+import time
+from collections import defaultdict
+from typing import Dict, List, Optional
+from uuid import uuid4
 
-from fastapi import APIRouter, FastAPI, WebSocket, WebSocketDisconnect from fastapi.middleware.cors import CORSMiddleware from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 
 app = FastAPI(title="LinkUp")
 
-cors_origins = os.getenv("CORS_ORIGINS", "").strip() if cors_origins == "": allowed_origins = ["*"] else: allowed_origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
+# ----------------------------
+# CONFIG
+# ----------------------------
 
-app.add_middleware( CORSMiddleware, allow_origins=allowed_origins, allow_credentials=True, allow_methods=[""], allow_headers=[""], )
+class Settings:
+    def __init__(self) -> None:
+        origins = os.getenv("CORS_ORIGINS", "*").strip()
+        self.cors_origins = ["*"] if origins == "*" else [o.strip() for o in origins.split(",") if o.strip()]
+
+
+settings = Settings()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 ws_router = APIRouter()
 
-@dataclass class Profile: user_id: str username: str display_name: str avatar_url: str bio: str = "" followers: int = 0 following: int = 0 posts: int = 0 created_at: int = 0
+ROOM_META = [
+    {"id": "general", "name": "general", "desc": "Town square for everything."},
+    {"id": "dev", "name": "dev", "desc": "Builds, bugs, and code."},
+    {"id": "clips", "name": "clips", "desc": "Short clips and highlights."},
+    {"id": "study", "name": "study", "desc": "Focus, notes, learning."},
+]
 
-@dataclass class Post: post_id: str author_id: str author_name: str text: str media_url: str = "" media_type: str = "text" created_at: int = 0 likes: int = 0 comments: int = 0 reposts: int = 0 pinned: bool = False
+SEARCH_SUGGESTIONS = ["#python", "#games", "#art", "#music", "#ai", "#clips", "#buildinpublic"]
 
-@dataclass class Comment: comment_id: str post_id: str author_id: str author_name: str text: str created_at: int = 0
+# ----------------------------
+# HELPERS
+# ----------------------------
 
-class LinkUpState: def init(self) -> None: self.profiles: Dict[str, Profile] = {} self.posts: Deque[Post] = deque(maxlen=2000) self.comments: Dict[str, List[Comment]] = defaultdict(list) self.following: Dict[str, Set[str]] = defaultdict(set) self.followers: Dict[str, Set[str]] = defaultdict(set) self.likes: Dict[str, Set[str]] = defaultdict(set) self.reposts: Dict[str, Set[str]] = defaultdict(set) self.bookmarks: Dict[str, Set[str]] = defaultdict(set) self.room_clients: Dict[str, Dict[str, WebSocket]] = defaultdict(dict) self.room_presence: Dict[str, Dict[str, dict]] = defaultdict(dict) self.room_history: Dict[str, List[dict]] = defaultdict(list) self.room_pins: Dict[str, List[dict]] = defaultdict(list) self.room_last_typing: Dict[str, str] = {}
-
-def now(self) -> int:
+def now_ms() -> int:
     return int(time.time() * 1000)
 
-def safe_username(self, value: str) -> str:
-    value = (value or "").strip().lower()
-    value = "".join(ch for ch in value if ch.isalnum() or ch in {"_", "."})
-    return value[:20]
 
-def avatar_for(self, username: str) -> str:
-    seed = (username or "user").strip().lower() or "user"
-    return f"https://api.dicebear.com/8.x/thumbs/svg?seed={seed}"
+def uid(prefix: str) -> str:
+    return f"{prefix}_{uuid4().hex[:12]}"
 
-def ensure_profile(self, user_id: str, username: Optional[str] = None) -> Profile:
-    if user_id not in self.profiles:
-        uname = self.safe_username(username or f"user_{user_id[:6]}") or f"user_{user_id[:6]}"
-        self.profiles[user_id] = Profile(
-            user_id=user_id,
-            username=uname,
-            display_name=uname,
-            avatar_url=self.avatar_for(uname),
-            created_at=self.now(),
-        )
-    return self.profiles[user_id]
 
-def set_username(self, user_id: str, username: str) -> Profile:
-    profile = self.ensure_profile(user_id)
-    clean = self.safe_username(username) or profile.username
-    profile.username = clean
-    if not profile.display_name:
-        profile.display_name = clean
-    if not profile.avatar_url:
-        profile.avatar_url = self.avatar_for(clean)
-    return profile
+def clamp_text(value: str, length: int) -> str:
+    value = (value or "").strip()
+    return value[:length] if value else ""
 
-def set_display_name(self, user_id: str, display_name: str) -> Profile:
-    profile = self.ensure_profile(user_id)
-    profile.display_name = (display_name or profile.username)[:32]
-    return profile
 
-def set_avatar(self, user_id: str, avatar_url: str) -> Profile:
-    profile = self.ensure_profile(user_id)
-    profile.avatar_url = (avatar_url or "").strip() or self.avatar_for(profile.username)
-    return profile
-
-def set_bio(self, user_id: str, bio: str) -> Profile:
-    profile = self.ensure_profile(user_id)
-    profile.bio = (bio or "")[:220]
-    return profile
-
-def add_post(self, author_id: str, text: str, media_url: str = "", media_type: str = "text") -> Post:
-    profile = self.ensure_profile(author_id)
-    post = Post(
-        post_id="p_" + uuid4().hex[:12],
-        author_id=author_id,
-        author_name=profile.display_name or profile.username,
-        text=(text or "").strip(),
-        media_url=(media_url or "").strip(),
-        media_type=media_type,
-        created_at=self.now(),
+def escape_for_html(s: str) -> str:
+    return (
+        str(s)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
     )
-    self.posts.appendleft(post)
-    profile.posts += 1
-    return post
 
-def get_post(self, post_id: str) -> Optional[Post]:
-    for post in self.posts:
-        if post.post_id == post_id:
-            return post
-    return None
 
-def add_comment(self, post_id: str, author_id: str, text: str) -> Optional[Comment]:
-    post = self.get_post(post_id)
-    if not post:
-        return None
-    profile = self.ensure_profile(author_id)
-    comment = Comment(
-        comment_id="c_" + uuid4().hex[:12],
-        post_id=post_id,
-        author_id=author_id,
-        author_name=profile.display_name or profile.username,
-        text=(text or "").strip(),
-        created_at=self.now(),
-    )
-    self.comments[post_id].append(comment)
-    post.comments = len(self.comments[post_id])
-    return comment
-
-def like_post(self, user_id: str, post_id: str) -> int:
-    liked = self.likes[post_id]
-    if user_id in liked:
-        liked.remove(user_id)
-    else:
-        liked.add(user_id)
-    post = self.get_post(post_id)
-    if post:
-        post.likes = len(liked)
-        return post.likes
-    return len(liked)
-
-def repost(self, user_id: str, post_id: str) -> Optional[Post]:
-    original = self.get_post(post_id)
-    if not original:
-        return None
-    self.reposts[post_id].add(user_id)
-    if original:
-        original.reposts = len(self.reposts[post_id])
-    return self.add_post(user_id, f"Reposted: {original.text}", original.media_url, original.media_type)
-
-def bookmark_post(self, user_id: str, post_id: str) -> None:
-    if post_id in self.bookmarks[user_id]:
-        self.bookmarks[user_id].remove(post_id)
-    else:
-        self.bookmarks[user_id].add(post_id)
-
-def feed(self, limit: int = 100) -> List[dict]:
-    out: List[dict] = []
-    for post in list(self.posts)[:limit]:
-        item = asdict(post)
-        item["comments_list"] = [asdict(c) for c in self.comments.get(post.post_id, [])[-3:]]
-        out.append(item)
-    return out
-
-def profile_data(self, user_id: str) -> dict:
-    prof = self.ensure_profile(user_id)
+def serialize_profile(profile: dict) -> dict:
     return {
-        "profile": asdict(prof),
-        "posts": [asdict(p) | {"comments_list": [asdict(c) for c in self.comments.get(p.post_id, [])[-3:]]} for p in self.posts if p.author_id == user_id],
-        "followers": list(self.followers[user_id]),
-        "following": list(self.following[user_id]),
-        "bookmarks": list(self.bookmarks[user_id]),
+        "client_id": profile["client_id"],
+        "name": profile.get("name", "Guest"),
+        "avatar": profile.get("avatar", ""),
+        "bio": profile.get("bio", ""),
+        "accent": profile.get("accent", "#5865f2"),
+        "joined_at": profile.get("joined_at", now_ms()),
     }
 
-def search(self, query: str) -> List[dict]:
-    q = (query or "").strip().lower()
-    if not q:
-        return self.feed()
-    out: List[dict] = []
-    for post in self.posts:
-        if q in post.text.lower() or q in post.author_name.lower():
-            item = asdict(post)
-            item["comments_list"] = [asdict(c) for c in self.comments.get(post.post_id, [])[-3:]]
-            out.append(item)
-    return out[:100]
 
-async def broadcast(self, room_id: str, payload: dict) -> None:
-    dead: List[str] = []
-    for client_id, ws in self.room_clients[room_id].items():
-        try:
-            await ws.send_json(payload)
-        except Exception:
-            dead.append(client_id)
-    for cid in dead:
-        self.room_clients[room_id].pop(cid, None)
-        self.room_presence[room_id].pop(cid, None)
+def serialize_comment(comment: dict) -> dict:
+    return {
+        "id": comment["id"],
+        "client_id": comment["client_id"],
+        "name": comment.get("name", "Guest"),
+        "avatar": comment.get("avatar", ""),
+        "text": comment.get("text", ""),
+        "created_at": comment.get("created_at", now_ms()),
+    }
 
-async def push_presence(self, room_id: str) -> None:
-    await self.broadcast(room_id, {
-        "kind": "presence",
-        "room": room_id,
-        "users": list(self.room_presence[room_id].values()),
-        "time": self.now(),
-    })
 
-async def push_history(self, room_id: str, ws: WebSocket) -> None:
-    await ws.send_json({
-        "kind": "history",
-        "room": room_id,
-        "feed": self.feed(50),
-        "users": list(self.room_presence[room_id].values()),
-        "pins": self.room_pins[room_id][-30:],
-        "time": self.now(),
-    })
+def serialize_post(post: dict) -> dict:
+    return {
+        "id": post["id"],
+        "client_id": post["client_id"],
+        "name": post.get("name", "Guest"),
+        "avatar": post.get("avatar", ""),
+        "bio": post.get("bio", ""),
+        "text": post.get("text", ""),
+        "media_url": post.get("media_url", ""),
+        "media_type": post.get("media_type", "text"),
+        "created_at": post.get("created_at", now_ms()),
+        "likes": len(post.get("likes", set())),
+        "reposts": len(post.get("reposts", set())),
+        "comments": [serialize_comment(c) for c in post.get("comments", [])][-24:],
+    }
 
-state = LinkUpState()
 
-Seed content
+def serialize_message(msg: dict) -> dict:
+    return {
+        "msg_id": msg["msg_id"],
+        "client_id": msg["client_id"],
+        "name": msg.get("name", "Guest"),
+        "avatar": msg.get("avatar", ""),
+        "text": msg.get("text", ""),
+        "room": msg.get("room", "general"),
+        "created_at": msg.get("created_at", now_ms()),
+        "reply_to": msg.get("reply_to"),
+        "reply_preview": msg.get("reply_preview"),
+        "reactions": msg.get("reactions", {}),
+        "pinned": msg.get("pinned", False),
+    }
 
-for uid, uname in [("u_1", "nas9229alt"), ("u_2", "pixelwave"), ("u_3", "neonbyte")]: p = state.ensure_profile(uid, uname) p.display_name = uname
 
-state.add_post("u_1", "LinkUp is live. Post, clip, reply, like, repost, bookmark.") state.add_post("u_2", "Short-form content fits here too. Think TikTok-style posts.", media_type="short") state.add_post("u_3", "Long-form creators can live here as well. Think YouTube energy.", media_type="video")
+# ----------------------------
+# FEED STATE
+# ----------------------------
 
-@ws_router.websocket("/{room_id}") async def room_socket(websocket: WebSocket, room_id: str): await websocket.accept()
+FEED: List[dict] = []
+FEED_INDEX: Dict[str, dict] = {}
 
-client_id = "u_" + uuid4().hex[:10]
-profile = state.ensure_profile(client_id)
-state.room_clients[room_id][client_id] = websocket
-state.room_presence[room_id][client_id] = {
-    "client_id": client_id,
-    "username": profile.username,
-    "display_name": profile.display_name,
-    "avatar_url": profile.avatar_url,
-    "bio": profile.bio,
-    "online": True,
-    "joined_at": state.now(),
-}
 
-await websocket.send_json({
-    "kind": "init",
-    "you": client_id,
-    "profile": asdict(profile),
-    "feed": state.feed(50),
-    "users": list(state.room_presence[room_id].values()),
-    "pins": state.room_pins[room_id],
-    "time": state.now(),
-})
-await state.push_presence(room_id)
+def seed_feed() -> None:
+    if FEED:
+        return
 
-try:
-    while True:
-        raw = await websocket.receive_text()
-        try:
-            data = json.loads(raw)
-        except Exception:
-            data = {}
+    starter = [
+        {
+            "client_id": "seed_linkup",
+            "name": "LinkUp",
+            "avatar": "",
+            "bio": "official",
+            "text": "Welcome to LinkUp — a hybrid timeline + live rooms app.",
+            "media_url": "",
+            "media_type": "text",
+        },
+        {
+            "client_id": "seed_nova",
+            "name": "Nova",
+            "avatar": "",
+            "bio": "clipper",
+            "text": "You can post updates here and still jump into live rooms below.",
+            "media_url": "",
+            "media_type": "text",
+        },
+    ]
 
-        kind = data.get("kind", "")
+    for item in starter:
+        post = {
+            "id": uid("post"),
+            **item,
+            "created_at": now_ms(),
+            "likes": set(),
+            "reposts": set(),
+            "comments": [],
+        }
+        FEED.append(post)
+        FEED_INDEX[post["id"]] = post
 
-        if kind == "set_username":
-            profile = state.set_username(client_id, data.get("username", profile.username))
-            profile = state.set_display_name(client_id, data.get("display_name", profile.display_name))
-            state.room_presence[room_id][client_id].update({
-                "username": profile.username,
-                "display_name": profile.display_name,
-                "profile": asdict(profile),
-            })
-            await state.broadcast(room_id, {
-                "kind": "profile_update",
+
+seed_feed()
+
+
+def trending_posts() -> List[dict]:
+    ranked = sorted(
+        FEED,
+        key=lambda p: (len(p.get("likes", set())) + len(p.get("reposts", set())) + len(p.get("comments", []))),
+        reverse=True,
+    )
+    return [serialize_post(p) for p in ranked[:8]]
+
+
+# ----------------------------
+# ROOM STATE
+# ----------------------------
+
+class RoomState:
+    def __init__(self) -> None:
+        self.sockets: Dict[str, Dict[str, WebSocket]] = defaultdict(dict)
+        self.members: Dict[str, Dict[str, dict]] = defaultdict(dict)
+        self.history: Dict[str, List[dict]] = defaultdict(list)
+        self.pins: Dict[str, List[dict]] = defaultdict(list)
+        self.reactions: Dict[str, Dict[str, Dict[str, set]]] = defaultdict(lambda: defaultdict(lambda: defaultdict(set)))
+
+    def register(self, room: str, profile: dict, ws: WebSocket) -> None:
+        self.members[room][profile["client_id"]] = profile
+        self.sockets[room][profile["client_id"]] = ws
+
+    def remove(self, room: str, client_id: str) -> None:
+        self.sockets[room].pop(client_id, None)
+        self.members[room].pop(client_id, None)
+
+    def users(self, room: str) -> List[dict]:
+        users = [
+            serialize_profile(profile)
+            for cid, profile in self.members[room].items()
+            if cid in self.sockets[room]
+        ]
+        users.sort(key=lambda u: (u.get("name", "").lower(), u.get("joined_at", 0)))
+        return users
+
+    def history_view(self, room: str) -> List[dict]:
+        return [serialize_message(m) for m in self.history[room]][-180:]
+
+    def pins_view(self, room: str) -> List[dict]:
+        return self.pins[room][-30:]
+
+    def add_message(self, room: str, msg: dict) -> None:
+        self.history[room].append(msg)
+        if len(self.history[room]) > 400:
+            self.history[room] = self.history[room][-400:]
+
+    def find_message(self, room: str, msg_id: str) -> Optional[dict]:
+        for m in self.history[room]:
+            if m["msg_id"] == msg_id:
+                return m
+        return None
+
+    def toggle_pin(self, room: str, msg_id: str) -> Optional[dict]:
+        msg = self.find_message(room, msg_id)
+        if not msg:
+            return None
+
+        existing = next((p for p in self.pins[room] if p["id"] == msg_id), None)
+        if existing:
+            self.pins[room] = [p for p in self.pins[room] if p["id"] != msg_id]
+            msg["pinned"] = False
+            return {"action": "unpinned", "message": serialize_message(msg), "pins": self.pins_view(room)}
+
+        pin = {
+            "id": msg["msg_id"],
+            "name": msg.get("name", "Guest"),
+            "text": msg.get("text", ""),
+            "created_at": msg.get("created_at", now_ms()),
+        }
+        self.pins[room].append(pin)
+        msg["pinned"] = True
+        return {"action": "pinned", "message": serialize_message(msg), "pins": self.pins_view(room)}
+
+    def toggle_chat_reaction(self, room: str, msg_id: str, emoji: str, client_id: str) -> Optional[dict]:
+        msg = self.find_message(room, msg_id)
+        if not msg:
+            return None
+
+        bucket = self.reactions[room][msg_id][emoji]
+        if client_id in bucket:
+            bucket.remove(client_id)
+        else:
+            bucket.add(client_id)
+
+        msg["reactions"] = {e: len(users) for e, users in self.reactions[room][msg_id].items()}
+        return {"msg_id": msg_id, "reactions": msg["reactions"]}
+
+    async def broadcast_room(self, room: str, payload: dict) -> None:
+        dead = []
+        for cid, ws in self.sockets[room].items():
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                dead.append(cid)
+        for cid in dead:
+            self.remove(room, cid)
+
+    async def broadcast_all(self, payload: dict) -> None:
+        for room in list(self.sockets.keys()):
+            await self.broadcast_room(room, payload)
+
+    async def send_init(self, room: str, ws: WebSocket, client_id: str) -> None:
+        await ws.send_json(
+            {
+                "kind": "init",
                 "client_id": client_id,
-                "profile": asdict(profile),
-                "time": state.now(),
-            })
-            continue
+                "room": room,
+                "users": self.users(room),
+                "history": self.history_view(room),
+                "pins": self.pins_view(room),
+                "feed": [serialize_post(p) for p in FEED][-60:],
+                "feed_trending": trending_posts(),
+                "rooms": ROOM_META,
+                "suggestions": SEARCH_SUGGESTIONS,
+                "time": now_ms(),
+            }
+        )
 
-        if kind == "set_display_name":
-            profile = state.set_display_name(client_id, data.get("display_name", profile.display_name))
-            state.room_presence[room_id][client_id]["display_name"] = profile.display_name
-            await state.broadcast(room_id, {
-                "kind": "profile_update",
-                "client_id": client_id,
-                "profile": asdict(profile),
-                "time": state.now(),
-            })
-            continue
+    async def send_presence(self, room: str) -> None:
+        await self.broadcast_room(
+            room,
+            {
+                "kind": "presence",
+                "room": room,
+                "users": self.users(room),
+                "time": now_ms(),
+            },
+        )
 
-        if kind == "set_avatar":
-            profile = state.set_avatar(client_id, data.get("avatar_url", profile.avatar_url))
-            state.room_presence[room_id][client_id]["avatar_url"] = profile.avatar_url
-            await state.broadcast(room_id, {
-                "kind": "profile_update",
-                "client_id": client_id,
-                "profile": asdict(profile),
-                "time": state.now(),
-            })
-            continue
 
-        if kind == "set_bio":
-            profile = state.set_bio(client_id, data.get("bio", profile.bio))
-            state.room_presence[room_id][client_id]["bio"] = profile.bio
-            await state.broadcast(room_id, {
-                "kind": "profile_update",
-                "client_id": client_id,
-                "profile": asdict(profile),
-                "time": state.now(),
-            })
-            continue
+ROOMS = RoomState()
 
-        if kind == "typing":
-            await state.broadcast(room_id, {
-                "kind": "typing",
-                "client_id": client_id,
-                "display_name": profile.display_name,
-                "time": state.now(),
-            })
-            continue
+# ----------------------------
+# PROFILES
+# ----------------------------
 
-        if kind == "get_feed":
-            await websocket.send_json({"kind": "feed_data", "feed": state.feed(50), "time": state.now()})
-            continue
+PROFILES: Dict[str, dict] = {}
 
-        if kind == "search_posts":
-            q = data.get("query", "")
-            await websocket.send_json({"kind": "search_results", "query": q, "feed": state.search(q), "time": state.now()})
-            continue
 
-        if kind == "get_profile":
-            uid = data.get("user_id") or client_id
-            await websocket.send_json({"kind": "profile_data", **state.profile_data(uid), "time": state.now()})
-            continue
+def get_profile(client_id: str) -> dict:
+    if client_id not in PROFILES:
+        PROFILES[client_id] = {
+            "client_id": client_id,
+            "name": "Guest",
+            "avatar": "",
+            "bio": "",
+            "accent": "#5865f2",
+            "joined_at": now_ms(),
+        }
+    return PROFILES[client_id]
 
-        if kind == "follow":
-            target = data.get("target_user_id", "")
-            if target and target != client_id:
-                state.following[client_id].add(target)
-                state.followers[target].add(client_id)
-                await websocket.send_json({"kind": "follow_result", "ok": True, "time": state.now()})
-            continue
 
-        if kind == "unfollow":
-            target = data.get("target_user_id", "")
-            if target:
-                state.following[client_id].discard(target)
-                state.followers[target].discard(client_id)
-                await websocket.send_json({"kind": "follow_result", "ok": True, "time": state.now()})
-            continue
+# ----------------------------
+# WEBSOCKET
+# ----------------------------
 
-        if kind == "room_post":
-            text = (data.get("text") or "").strip()
-            media_url = (data.get("media_url") or "").strip()
-            media_type = (data.get("media_type") or "text").strip()
-            if not text and not media_url:
+@ws_router.websocket("/{room_id}")
+async def websocket_endpoint(websocket: WebSocket, room_id: str):
+    await websocket.accept()
+
+    client_id = "cli_" + uuid4().hex[:10]
+    profile = get_profile(client_id)
+    active_room = room_id
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+
+            try:
+                data = json.loads(raw)
+                if not isinstance(data, dict):
+                    data = {}
+            except Exception:
+                data = {}
+
+            kind = str(data.get("kind") or "hello")
+
+            if kind == "hello":
+                client_id = str(data.get("client_id") or client_id)
+                profile = get_profile(client_id)
+                profile["name"] = clamp_text(str(data.get("name") or profile["name"]), 24) or "Guest"
+                profile["avatar"] = str(data.get("avatar") or profile.get("avatar") or "")
+                profile["bio"] = clamp_text(str(data.get("bio") or profile.get("bio") or ""), 80)
+                active_room = str(data.get("room") or room_id)
+
+                ROOMS.register(active_room, profile, websocket)
+                await ROOMS.send_init(active_room, websocket, client_id)
+                await ROOMS.send_presence(active_room)
+
+                await ROOMS.broadcast_all(
+                    {
+                        "kind": "profile_update",
+                        "profile": serialize_profile(profile),
+                        "time": now_ms(),
+                    }
+                )
                 continue
-            post = state.add_post(client_id, text, media_url=media_url, media_type=media_type)
-            await state.broadcast(room_id, {"kind": "feed_post", "post": asdict(post), "time": state.now()})
-            continue
 
-        if kind == "comment":
-            post_id = data.get("post_id", "")
-            text = (data.get("text") or "").strip()
-            comment = state.add_comment(post_id, client_id, text)
-            if comment:
-                post = state.get_post(post_id)
-                await state.broadcast(room_id, {
-                    "kind": "comment_added",
-                    "post_id": post_id,
-                    "comment": asdict(comment),
-                    "post": asdict(post) if post else None,
-                    "time": state.now(),
-                })
-            continue
+            if kind == "profile":
+                old_name = profile["name"]
+                profile = get_profile(client_id)
+                profile["name"] = clamp_text(str(data.get("name") or profile["name"]), 24) or "Guest"
+                profile["avatar"] = str(data.get("avatar") or profile.get("avatar") or "")
+                profile["bio"] = clamp_text(str(data.get("bio") or profile.get("bio") or ""), 80)
 
-        if kind == "like":
-            post_id = data.get("post_id", "")
-            count = state.like_post(client_id, post_id)
-            post = state.get_post(post_id)
-            await state.broadcast(room_id, {
-                "kind": "like_update",
-                "post_id": post_id,
-                "likes": count,
-                "post": asdict(post) if post else None,
-                "time": state.now(),
-            })
-            continue
+                if active_room:
+                    ROOMS.register(active_room, profile, websocket)
+                    await ROOMS.send_presence(active_room)
 
-        if kind == "repost":
-            post_id = data.get("post_id", "")
-            new_post = state.repost(client_id, post_id)
-            if new_post:
-                await state.broadcast(room_id, {"kind": "feed_post", "post": asdict(new_post), "repost_of": post_id, "time": state.now()})
-            continue
+                await ROOMS.broadcast_all(
+                    {
+                        "kind": "profile_update",
+                        "profile": serialize_profile(profile),
+                        "old_name": old_name,
+                        "time": now_ms(),
+                    }
+                )
+                continue
 
-        if kind == "bookmark":
-            post_id = data.get("post_id", "")
-            if post_id:
-                state.bookmark_post(client_id, post_id)
-                await websocket.send_json({"kind": "bookmark_result", "ok": True, "time": state.now()})
-            continue
+            if kind == "typing":
+                await ROOMS.broadcast_room(
+                    active_room,
+                    {
+                        "kind": "typing",
+                        "client_id": client_id,
+                        "name": profile["name"],
+                        "time": now_ms(),
+                    },
+                )
+                continue
 
-        if kind == "pin":
-            post_id = data.get("post_id", "")
-            post = state.get_post(post_id)
-            if post:
-                pinned = next((p for p in state.room_pins[room_id] if p["post_id"] == post_id), None)
-                if pinned:
-                    state.room_pins[room_id] = [p for p in state.room_pins[room_id] if p["post_id"] != post_id]
+            if kind == "chat":
+                text = clamp_text(str(data.get("text") or ""), 5000)
+                if not text:
+                    continue
+
+                reply_to = data.get("reply_to")
+                reply_preview = None
+                if reply_to:
+                    prev = ROOMS.find_message(active_room, str(reply_to))
+                    if prev:
+                        reply_preview = {
+                            "msg_id": prev["msg_id"],
+                            "name": prev.get("name", "Guest"),
+                            "text": prev.get("text", "")[:120],
+                        }
+
+                message = {
+                    "msg_id": uid("msg"),
+                    "client_id": client_id,
+                    "name": profile["name"],
+                    "avatar": profile["avatar"],
+                    "text": text,
+                    "room": active_room,
+                    "created_at": now_ms(),
+                    "reply_to": reply_to,
+                    "reply_preview": reply_preview,
+                    "reactions": {},
+                    "pinned": False,
+                }
+                ROOMS.add_message(active_room, message)
+                await ROOMS.broadcast_room(active_room, {"kind": "chat_message", "message": serialize_message(message)})
+                continue
+
+            if kind == "pin_chat":
+                result = ROOMS.toggle_pin(active_room, str(data.get("msg_id") or ""))
+                if result:
+                    await ROOMS.broadcast_room(
+                        active_room,
+                        {
+                            "kind": "pin_update",
+                            **result,
+                            "time": now_ms(),
+                        },
+                    )
+                continue
+
+            if kind == "react_chat":
+                result = ROOMS.toggle_chat_reaction(
+                    active_room,
+                    str(data.get("msg_id") or ""),
+                    str(data.get("emoji") or "👍")[:4],
+                    client_id,
+                )
+                if result:
+                    await ROOMS.broadcast_room(
+                        active_room,
+                        {
+                            "kind": "reaction_update",
+                            **result,
+                            "time": now_ms(),
+                        },
+                    )
+                continue
+
+            if kind == "post":
+                text = clamp_text(str(data.get("text") or ""), 5000)
+                media_url = str(data.get("media_url") or "").strip()
+                media_type = str(data.get("media_type") or "text").strip()
+
+                if not text and not media_url:
+                    continue
+
+                post = {
+                    "id": uid("post"),
+                    "client_id": client_id,
+                    "name": profile["name"],
+                    "avatar": profile["avatar"],
+                    "bio": profile["bio"],
+                    "text": text,
+                    "media_url": media_url,
+                    "media_type": media_type,
+                    "created_at": now_ms(),
+                    "likes": set(),
+                    "reposts": set(),
+                    "comments": [],
+                }
+                FEED.insert(0, post)
+                FEED_INDEX[post["id"]] = post
+
+                await ROOMS.broadcast_all(
+                    {
+                        "kind": "feed_post",
+                        "post": serialize_post(post),
+                        "time": now_ms(),
+                    }
+                )
+                continue
+
+            if kind == "feed_like":
+                pid = str(data.get("post_id") or "")
+                post = FEED_INDEX.get(pid)
+                if not post:
+                    continue
+                likes = post["likes"]
+                if client_id in likes:
+                    likes.remove(client_id)
                 else:
-                    state.room_pins[room_id].append({
-                        "post_id": post.post_id,
-                        "author_name": post.author_name,
-                        "text": post.text,
-                        "time": post.created_at,
-                    })
-                await state.broadcast(room_id, {"kind": "pins_update", "pins": state.room_pins[room_id], "time": state.now()})
-            continue
+                    likes.add(client_id)
 
-        if kind == "ping":
-            await websocket.send_json({"kind": "pong", "time": state.now()})
-            continue
+                await ROOMS.broadcast_all(
+                    {
+                        "kind": "feed_update",
+                        "post": serialize_post(post),
+                        "time": now_ms(),
+                    }
+                )
+                continue
 
-except WebSocketDisconnect:
-    state.room_clients[room_id].pop(client_id, None)
-    state.room_presence[room_id].pop(client_id, None)
-    await state.push_presence(room_id)
+            if kind == "feed_repost":
+                pid = str(data.get("post_id") or "")
+                post = FEED_INDEX.get(pid)
+                if not post:
+                    continue
+                reps = post["reposts"]
+                if client_id in reps:
+                    reps.remove(client_id)
+                else:
+                    reps.add(client_id)
 
-@app.get("/health") def health(): return {"ok": True, "app": "LinkUp"}
+                await ROOMS.broadcast_all(
+                    {
+                        "kind": "feed_update",
+                        "post": serialize_post(post),
+                        "time": now_ms(),
+                    }
+                )
+                continue
 
-@app.get("/api/feed") def api_feed(limit: int = 50): return {"feed": state.feed(limit)}
+            if kind == "feed_comment":
+                pid = str(data.get("post_id") or "")
+                post = FEED_INDEX.get(pid)
+                if not post:
+                    continue
 
-@app.get("/api/profile/{user_id}") def api_profile(user_id: str): return state.profile_data(user_id)
+                text = clamp_text(str(data.get("text") or ""), 1000)
+                if not text:
+                    continue
 
-@app.get("/", response_class=HTMLResponse) def home(): return HTMLResponse(_html())
+                comment = {
+                    "id": uid("c"),
+                    "client_id": client_id,
+                    "name": profile["name"],
+                    "avatar": profile["avatar"],
+                    "text": text,
+                    "created_at": now_ms(),
+                }
+                post["comments"].append(comment)
 
-@app.get("/{path:path}", response_class=HTMLResponse) def spa(path: str): return HTMLResponse(_html())
+                await ROOMS.broadcast_all(
+                    {
+                        "kind": "feed_update",
+                        "post": serialize_post(post),
+                        "time": now_ms(),
+                    }
+                )
+                continue
 
-def _html() -> str: return """<!doctype html>
+    except WebSocketDisconnect:
+        ROOMS.remove(active_room, client_id)
+        await ROOMS.send_presence(active_room)
+    except Exception:
+        ROOMS.remove(active_room, client_id)
+        await ROOMS.send_presence(active_room)
 
-<html lang='en'>
+
+app.include_router(ws_router)
+
+# ----------------------------
+# UI
+# ----------------------------
+
+def page_html() -> str:
+    return """<!doctype html>
+<html lang="en">
 <head>
-  <meta charset='utf-8' />
-  <meta name='viewport' content='width=device-width, initial-scale=1' />
-  <title>LinkUp</title>
-  <style>
-    :root{--bg:#313338;--side:#2b2d31;--side2:#1e1f22;--text:#f2f3f5;--muted:#b5bac1;--line:rgba(255,255,255,.06);--accent:#5865f2;--green:#3ba55d;}
-    *{box-sizing:border-box}
-    html,body{height:100%} body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,system-ui,sans-serif;overflow:hidden}
-    button,input,textarea{font:inherit}
-    .app{height:100vh;display:grid;grid-template-columns:72px 240px minmax(0,1fr) 280px}
-    .servers{background:var(--side2);border-right:1px solid var(--line);overflow-y:auto;padding:10px 0;display:flex;flex-direction:column;align-items:center;gap:10px}
-    .srv{width:48px;height:48px;border:none;border-radius:16px;background:#383a40;color:var(--text);font-weight:800;cursor:pointer}.srv.active{background:var(--accent)}
-    .sidebar{background:var(--side);border-right:1px solid var(--line);display:flex;flex-direction:column;min-width:0;overflow:hidden}
-    .head{padding:14px;border-bottom:1px solid var(--line)} .head h1{margin:0;font-size:17px} .head small{display:block;color:var(--muted);font-size:12px;margin-top:4px}
-    .pill{display:inline-flex;margin-top:10px;padding:7px 10px;border-radius:999px;background:rgba(255,255,255,.05);color:var(--muted);font-size:12px}
-    .channels{padding:8px;overflow-y:auto;min-height:0;flex:1}.sec{margin:8px 8px 10px;color:#969aa3;font-size:11px;letter-spacing:.12em;text-transform:uppercase}
-    .channel{display:flex;justify-content:space-between;align-items:center;width:100%;border:none;background:transparent;color:var(--text);padding:10px;border-radius:8px;cursor:pointer;text-align:left}.channel:hover{background:rgba(255,255,255,.04)}.channel.active{background:rgba(255,255,255,.08)}
-    .channel .meta{min-width:0;display:flex;flex-direction:column}.channel .meta strong{font-size:14px}.channel .meta span{font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:160px}
-    .main{display:flex;flex-direction:column;overflow:hidden;min-width:0;background:#313338}
-    .top{height:54px;display:flex;justify-content:space-between;align-items:center;gap:10px;padding:0 16px;border-bottom:1px solid var(--line);background:rgba(49,51,56,.94)}
-    .top h2{margin:0;font-size:16px}.top p{margin:2px 0 0;color:var(--muted);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:45vw}
-    .status{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:12px}.dot{width:10px;height:10px;border-radius:999px;background:var(--green)}
-    .meta{display:flex;justify-content:space-between;gap:10px;align-items:center;padding:12px 16px;border-bottom:1px solid var(--line);background:rgba(255,255,255,.02)}
-    .stats{display:flex;gap:8px;flex-wrap:wrap}.stat{padding:7px 10px;border-radius:999px;background:rgba(255,255,255,.05);color:var(--muted);font-size:12px;white-space:nowrap}
-    .search{width:min(420px,42vw);padding:10px 12px;border:none;outline:none;border-radius:10px;background:#1f242f;color:var(--text)}
-    .feed{flex:1;min-height:0;overflow-y:auto;padding:18px 0 120px}
-    .inner{width:min(920px,calc(100vw - 32px));margin:0 auto}
-    .post{background:#2b2d31;border:1px solid var(--line);border-radius:16px;padding:14px;margin-bottom:12px}
-    .post-head{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.author{display:flex;gap:10px;align-items:center;min-width:0}.avatar{width:44px;height:44px;border-radius:50%;background:#272c37;object-fit:cover;flex:0 0 auto}
-    .author strong{display:block;font-size:14px}.author span{display:block;font-size:12px;color:var(--muted)}
-    .post-text{margin-top:10px;line-height:1.6;white-space:pre-wrap;word-break:break-word}.media{margin-top:12px;border-radius:14px;overflow:hidden;background:#000}.media img,.media video{width:100%;display:block;max-height:520px;object-fit:cover}
-    .actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.tiny{border:none;padding:8px 10px;border-radius:999px;background:#262b35;color:var(--text);cursor:pointer;font-size:12px}.tiny:hover{background:#303646}
-    .comments{margin-top:12px;display:flex;flex-direction:column;gap:8px}.comment{padding:10px 12px;border-radius:12px;background:rgba(255,255,255,.03);border:1px solid var(--line)}.comment .who{font-weight:700;font-size:13px;margin-bottom:4px}
-    .typing{height:18px;padding:0 16px 8px;color:#c9ced8;font-size:12px}
-    .composer-wrap{position:sticky;bottom:0;background:linear-gradient(180deg,rgba(49,51,56,0),rgba(49,51,56,.9) 20%,rgba(49,51,56,1));padding:14px 0 18px}.composer{width:min(920px,calc(100vw - 32px));margin:0 auto;background:#383a40;border:1px solid var(--line);border-radius:16px;padding:14px}
-    .composer-top{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}.namepill{padding:7px 10px;border-radius:999px;background:rgba(255,255,255,.05);color:var(--muted);font-size:12px}
-    .composer textarea{width:100%;min-height:80px;max-height:180px;resize:none;overflow-y:auto;border:none;outline:none;background:transparent;color:var(--text);line-height:1.6;font-size:15px}
-    .composer-actions{display:flex;justify-content:space-between;gap:10px;align-items:center;flex-wrap:wrap;margin-top:10px}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.btn{border:none;border-radius:10px;background:#262b35;color:var(--text);padding:10px 12px;cursor:pointer}.btn.primary{background:var(--accent)}
-    .right{background:var(--side);border-left:1px solid var(--line);display:flex;flex-direction:column;overflow:hidden;min-width:0}.right-head{padding:14px;border-bottom:1px solid var(--line)}.profile{display:flex;gap:12px;align-items:center}.profile-pic{width:56px;height:56px;border-radius:50%;object-fit:cover;background:#272c37}.profile h3{margin:0;font-size:16px}.profile p{margin:4px 0 0;color:var(--muted);font-size:12px;line-height:1.5}
-    .right-body{overflow-y:auto;min-height:0;padding:10px}.box{background:#23262d;border:1px solid var(--line);border-radius:14px;padding:12px;margin-bottom:12px}.field{display:flex;flex-direction:column;gap:6px;margin-top:10px}.field label{font-size:12px;color:#c2c8d4}.field input,.field textarea{width:100%;padding:10px 12px;border-radius:10px;border:none;outline:none;background:#1f242f;color:var(--text)}.list{display:flex;flex-direction:column;gap:8px}.item{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 12px;border-radius:12px;background:rgba(255,255,255,.04)}
-    @media (max-width: 1200px){.app{grid-template-columns:72px 240px minmax(0,1fr)}.right{display:none}.search{width:40vw}}
-    @media (max-width: 820px){body{overflow:auto}.app{height:auto;min-height:100vh;grid-template-columns:1fr}.servers{flex-direction:row;overflow-x:auto;overflow-y:hidden;padding:10px}.sidebar{min-height:220px}.right{display:block;min-height:240px}.top,.meta{flex-direction:column;align-items:stretch}.search{width:100%}.inner,.composer{width:calc(100vw - 20px)}}
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LinkUp</title>
+<style>
+:root{
+  --bg:#313338; --panel:#2b2d31; --panel2:#1e1f22; --text:#f2f3f5; --muted:#b5bac1;
+  --accent:#5865f2; --accent2:#3ba55d; --line:rgba(255,255,255,.06);
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{
+  margin:0;
+  font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  background:var(--bg);
+  color:var(--text);
+  overflow:hidden;
+}
+button,input,textarea,select{font:inherit}
+.app{
+  height:100vh;
+  display:grid;
+  grid-template-columns:72px 248px minmax(0,1fr) 280px;
+  min-width:0;
+}
+.rail{
+  background:var(--panel2);
+  border-right:1px solid var(--line);
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
+}
+.serverrail{
+  padding:12px 0;
+  align-items:center;
+  gap:10px;
+}
+.serverbtn{
+  width:48px;height:48px;
+  border:none;
+  border-radius:16px;
+  background:#383a40;
+  color:#fff;
+  font-weight:800;
+  cursor:pointer;
+}
+.serverbtn.active{background:var(--accent)}
+.sidebar{
+  background:var(--panel);
+  border-right:1px solid var(--line);
+  display:flex;
+  flex-direction:column;
+  min-width:0;
+  overflow:hidden;
+}
+.rightbar{
+  background:var(--panel);
+  border-left:1px solid var(--line);
+  display:flex;
+  flex-direction:column;
+  min-width:0;
+  overflow:hidden;
+}
+.head{
+  padding:16px;
+  border-bottom:1px solid var(--line);
+  flex:0 0 auto;
+}
+.brand{
+  display:flex;
+  justify-content:space-between;
+  gap:10px;
+  align-items:flex-start;
+}
+.brand h1{margin:0;font-size:16px}
+.brand small{display:block;color:var(--muted);font-size:12px;margin-top:3px}
+.pill{
+  display:inline-flex;
+  align-items:center;
+  margin-top:10px;
+  padding:6px 10px;
+  border-radius:999px;
+  background:rgba(255,255,255,.04);
+  color:var(--muted);
+  font-size:12px;
+}
+.scroll{
+  min-height:0;
+  overflow-y:auto;
+  flex:1;
+}
+.section{
+  padding:10px 8px 8px;
+}
+.sectiontitle{
+  margin:6px 8px 10px;
+  color:#969aa3;
+  font-size:11px;
+  font-weight:700;
+  text-transform:uppercase;
+  letter-spacing:.09em;
+}
+.channel{
+  width:100%;
+  border:none;
+  border-radius:8px;
+  padding:10px;
+  margin-bottom:2px;
+  background:transparent;
+  color:#fff;
+  display:flex;
+  justify-content:space-between;
+  gap:10px;
+  text-align:left;
+  cursor:pointer;
+}
+.channel.active,.channel:hover{background:rgba(255,255,255,.04)}
+.channel .meta{
+  min-width:0;
+  display:flex;
+  flex-direction:column;
+}
+.channel strong{font-size:15px}
+.channel span{
+  font-size:12px;
+  color:var(--muted);
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  max-width:160px;
+}
+.badge{
+  font-size:11px;
+  padding:3px 7px;
+  border-radius:999px;
+  background:rgba(255,255,255,.06);
+  color:#d5d8de;
+  flex:0 0 auto;
+}
+.main{
+  min-width:0;
+  display:flex;
+  flex-direction:column;
+  overflow:hidden;
+}
+.topbar{
+  height:50px;
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  padding:0 16px;
+  border-bottom:1px solid var(--line);
+  background:rgba(49,51,56,.95);
+}
+.titleblock{
+  display:flex;
+  align-items:center;
+  gap:12px;
+  min-width:0;
+}
+.titleblock h2{margin:0;font-size:15px}
+.titleblock p{
+  margin:0;
+  color:var(--muted);
+  font-size:12px;
+  white-space:nowrap;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  max-width:40vw;
+}
+.conn{
+  display:flex;
+  gap:8px;
+  align-items:center;
+  color:var(--muted);
+  font-size:12px;
+  flex:0 0 auto;
+}
+.dot{
+  width:10px;height:10px;border-radius:999px;
+  background:var(--accent2);
+  box-shadow:0 0 0 4px rgba(59,165,93,.1);
+}
+.toolbar{
+  display:flex;
+  gap:10px;
+  align-items:center;
+}
+.tabs{
+  display:flex;
+  gap:8px;
+}
+.tab{
+  border:none;
+  background:#40444b;
+  color:#fff;
+  padding:8px 12px;
+  border-radius:999px;
+  cursor:pointer;
+}
+.tab.active{background:var(--accent)}
+.search{
+  width:260px;
+  max-width:30vw;
+  padding:9px 12px;
+  border:none;
+  border-radius:8px;
+  background:#1e1f22;
+  color:#fff;
+  outline:none;
+}
+.content{
+  min-height:0;
+  overflow-y:auto;
+  flex:1;
+  padding:14px;
+}
+.pane{display:none}
+.pane.active{display:block}
+.box{
+  padding:14px;
+  border-radius:10px;
+  background:#2b2d31;
+  border:1px solid var(--line);
+  margin-bottom:12px;
+}
+.label{
+  color:var(--muted);
+  font-size:12px;
+  margin-bottom:8px;
+}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+.input,.textarea,select{
+  border:none;
+  outline:none;
+  background:#1e1f22;
+  color:#fff;
+  border-radius:8px;
+  padding:10px 12px;
+}
+.textarea{
+  width:100%;
+  min-height:88px;
+  max-height:160px;
+  overflow-y:auto;
+  resize:none;
+}
+.input{flex:1;min-width:180px}
+.select{padding:10px 12px}
+.primary{
+  border:none;
+  background:var(--accent);
+  color:#fff;
+  border-radius:8px;
+  padding:10px 14px;
+  cursor:pointer;
+  font-weight:700;
+}
+.secondary{
+  border:none;
+  background:#40444b;
+  color:#fff;
+  border-radius:8px;
+  padding:10px 14px;
+  cursor:pointer;
+}
+.post,.msgbox{
+  padding:14px;
+  border-radius:10px;
+  background:#2b2d31;
+  border:1px solid var(--line);
+  margin-bottom:10px;
+}
+.posthead,.msghead{
+  display:flex;
+  justify-content:space-between;
+  gap:10px;
+  align-items:center;
+}
+.person{
+  display:flex;
+  gap:10px;
+  align-items:center;
+  min-width:0;
+}
+.avatar{
+  width:40px;
+  height:40px;
+  border-radius:50%;
+  background:var(--accent);
+  display:grid;
+  place-items:center;
+  font-weight:800;
+  flex:0 0 auto;
+  overflow:hidden;
+}
+.avatarimg{
+  width:40px;
+  height:40px;
+  border-radius:50%;
+  object-fit:cover;
+  flex:0 0 auto;
+  background:#40444b;
+}
+.person b{display:block;font-size:14px}
+.person span,.stamp{font-size:12px;color:var(--muted)}
+.posttext,.msgtext{
+  margin-top:10px;
+  line-height:1.55;
+  white-space:pre-wrap;
+  word-break:break-word;
+}
+.media{
+  margin-top:12px;
+  border-radius:10px;
+  overflow:hidden;
+  background:#111;
+}
+.media img,.media video{
+  display:block;
+  width:100%;
+  max-height:440px;
+  object-fit:cover;
+}
+.actions{
+  display:flex;
+  gap:8px;
+  flex-wrap:wrap;
+  margin-top:10px;
+}
+.chip{
+  border:none;
+  background:#40444b;
+  color:#fff;
+  padding:7px 10px;
+  border-radius:999px;
+  cursor:pointer;
+  font-size:12px;
+}
+.chip.active{background:rgba(88,101,242,.9)}
+.replybox{
+  margin-top:8px;
+  padding:8px 10px;
+  border-left:3px solid var(--accent);
+  background:rgba(88,101,242,.08);
+  border-radius:8px;
+  font-size:12px;
+  color:#dfe4ff;
+}
+.list{
+  padding:0 8px 8px;
+  overflow-y:auto;
+}
+.user{
+  display:flex;
+  justify-content:space-between;
+  gap:8px;
+  align-items:flex-start;
+  padding:10px;
+  border-radius:8px;
+}
+.user:hover{background:rgba(255,255,255,.04)}
+.user .left{min-width:0}
+.user .left strong{
+  display:block;
+  font-size:14px;
+}
+.user .left span{
+  display:block;
+  color:var(--muted);
+  font-size:12px;
+  margin-top:2px;
+}
+.pills{
+  display:flex;
+  flex-wrap:wrap;
+  gap:8px;
+  padding:0 8px 8px;
+}
+.pill2{
+  padding:7px 10px;
+  border-radius:999px;
+  background:rgba(255,255,255,.05);
+  font-size:12px;
+  color:#d7dae0;
+}
+.smallnote{
+  padding:12px 16px;
+  color:var(--muted);
+  font-size:12px;
+  line-height:1.6;
+}
+@media (max-width:1100px){
+  .app{grid-template-columns:72px 240px minmax(0,1fr)}
+  .rightbar{display:none}
+  .search{width:180px;max-width:35vw}
+}
+@media (max-width:820px){
+  body{overflow:auto}
+  .app{
+    height:auto;
+    min-height:100vh;
+    grid-template-columns:1fr;
+  }
+  .sidebar,.rightbar{display:none}
+  .main{min-height:100vh}
+  .search{display:none}
+}
+</style>
 </head>
 <body>
-  <div class='app'>
-    <aside class='servers' id='servers'></aside>
-    <aside class='sidebar'>
-      <div class='head'>
-        <h1>LinkUp</h1>
-        <small>social feed + short clips + creators</small>
-        <div class='pill'>Room <span id='roomLabel'>#global</span></div>
+<div class="app">
+  <aside class="rail serverrail" id="servers"></aside>
+
+  <aside class="sidebar">
+    <div class="head">
+      <div class="brand">
+        <div>
+          <h1>LinkUp</h1>
+          <small>Twitter x Discord hybrid</small>
+        </div>
+        <span class="badge">LIVE</span>
       </div>
-      <div class='channels'><div class='sec'>Spaces</div><div id='channels'></div></div>
-    </aside><main class='main'>
-  <div class='top'><div><h2 id='channelTitle'>Global Feed</h2><p id='channelDescription'>Post updates, clips, and creator content.</p></div><div class='status'><span class='dot'></span><span id='connState'>connecting...</span></div></div>
-  <div class='meta'><div class='stats'><div class='stat' id='statPosts'>0 posts</div><div class='stat' id='statUsers'>0 online</div><div class='stat' id='statFeed'>0 items</div></div><input class='search' id='searchInput' placeholder='Search posts, people, clips...' /></div>
-  <div class='typing' id='typingLine'></div>
-  <div class='feed'><div class='inner' id='feed'></div></div>
-  <div class='composer-wrap'><div class='composer'>
-    <div class='composer-top'><span class='namepill' id='youName'>You</span><span class='namepill' id='modeLabel'>Post mode</span><span class='namepill' id='replyLabel' style='display:none'></span></div>
-    <textarea id='composerText' placeholder='What’s happening on LinkUp?'></textarea>
-    <div class='composer-actions'><div class='row'><button class='btn' id='modePost'>Post</button><button class='btn' id='modeClip'>Short</button><button class='btn' id='modeVideo'>Video</button><button class='btn' id='modeLive'>Live</button></div><div class='row'><button class='btn primary' id='postBtn'>Publish</button></div></div>
-  </div></div>
-</main>
-
-<aside class='right'>
-  <div class='right-head'><div class='profile'><img class='profile-pic' id='profilePic' alt='avatar'/><div><h3 id='profileName'>Your profile</h3><p id='profileBio'>Edit your name, avatar, and bio anytime.</p></div></div></div>
-  <div class='right-body'>
-    <div class='box'>
-      <div class='field'><label>Username</label><input id='usernameInput' placeholder='username'/></div>
-      <div class='field'><label>Display name</label><input id='displayNameInput' placeholder='display name'/></div>
-      <div class='field'><label>Avatar URL</label><input id='avatarInput' placeholder='https://...'/></div>
-      <div class='field'><label>Bio</label><textarea id='bioInput' placeholder='Write something cool...'></textarea></div>
-      <div class='row' style='margin-top:10px'><button class='btn primary' id='saveProfile'>Save profile</button><button class='btn' id='randomAvatar'>Random avatar</button></div>
+      <div class="pill">Room: <span id="roomLabel">#general</span></div>
     </div>
-    <div class='box'><div class='sec'>Online now</div><div class='list' id='onlineList'></div></div>
-    <div class='box'><div class='sec'>Bookmarks</div><div class='list' id='bookmarksList'></div></div>
-  </div>
-</aside>
+    <div class="scroll">
+      <div class="section">
+        <div class="sectiontitle">Channels</div>
+        <div id="channels"></div>
+      </div>
+    </div>
+  </aside>
 
-  </div><script>
+  <main class="main">
+    <div class="topbar">
+      <div class="titleblock">
+        <h2 id="channelTitle"># general</h2>
+        <p id="channelDescription">A flatter, cleaner room for chat and posts.</p>
+      </div>
+      <div class="toolbar">
+        <div class="tabs">
+          <button class="tab active" data-tab="feed">Feed</button>
+          <button class="tab" data-tab="chat">Chat</button>
+        </div>
+        <input id="searchInput" class="search" placeholder="Search feed or chat...">
+        <div class="conn"><span class="dot"></span><span id="connState">connecting...</span></div>
+      </div>
+    </div>
+
+    <div class="content">
+      <div id="feedPane" class="pane active">
+        <div class="box">
+          <div class="label">Create a post</div>
+          <textarea id="postText" class="textarea" placeholder="What's happening?"></textarea>
+          <div class="row" style="margin-top:10px">
+            <input id="mediaUrl" class="input" placeholder="Media URL (image / video / clip)">
+            <select id="mediaType" class="select">
+              <option value="text">Text</option>
+              <option value="image">Image</option>
+              <option value="video">Video</option>
+            </select>
+            <button class="primary" id="postBtn">Post</button>
+          </div>
+        </div>
+        <div id="feedList"></div>
+      </div>
+
+      <div id="chatPane" class="pane">
+        <div class="box">
+          <div class="label">Message the room</div>
+          <textarea id="messageInput" class="textarea" placeholder="Message LinkUp..."></textarea>
+          <div class="row" style="margin-top:10px">
+            <button class="primary" id="sendBtn">Send</button>
+            <button class="secondary" id="clearReplyBtn">Clear reply</button>
+          </div>
+        </div>
+        <div id="messages"></div>
+      </div>
+    </div>
+  </main>
+
+  <aside class="rightbar">
+    <div class="head">
+      <div class="brand">
+        <div>
+          <h1>Your profile</h1>
+          <small>change it anytime</small>
+        </div>
+      </div>
+    </div>
+    <div class="scroll">
+      <div class="section">
+        <div class="label">Profile</div>
+        <div class="box">
+          <input id="nameInput" class="input" placeholder="Username">
+          <input id="avatarInput" class="input" placeholder="Avatar URL" style="margin-top:8px">
+          <textarea id="bioInput" class="textarea" placeholder="Bio" style="min-height:70px;margin-top:8px"></textarea>
+          <button class="primary" id="profileBtn" style="margin-top:8px">Save profile</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="label">Online now</div>
+        <div id="members" class="list"></div>
+      </div>
+
+      <div class="section">
+        <div class="label">Pinned messages</div>
+        <div id="pins" class="pills"></div>
+      </div>
+
+      <div class="section">
+        <div class="label">Trending posts</div>
+        <div id="trending" class="list"></div>
+      </div>
+
+      <div class="smallnote">
+        Users can change username and avatar anytime. No hard lock, no nonsense.
+      </div>
+    </div>
+  </aside>
+</div>
+
+<script>
 (() => {
-  const servers = [
-    { id: 'global', name: 'G', label: 'Global' },
-    { id: 'shorts', name: 'S', label: 'Shorts' },
-    { id: 'video', name: 'V', label: 'Video' },
-    { id: 'live', name: 'L', label: 'Live' },
+  const rooms = [
+    { id: "general", name: "general", desc: "Town square for everything." },
+    { id: "dev", name: "dev", desc: "Builds, bugs, and code." },
+    { id: "clips", name: "clips", desc: "Short clips and highlights." },
+    { id: "study", name: "study", desc: "Focus, notes, learning." },
   ];
 
-  const channelsByServer = {
-    global: [
-      { id: 'global', title: 'Global Feed', description: 'Posts, creators, clips, and discussions.' },
-      { id: 'trending', title: 'Trending', description: 'Fast-moving popular posts.' },
-      { id: 'explore', title: 'Explore', description: 'Search and discover content.' },
-    ],
-    shorts: [
-      { id: 'shorts', title: 'Shorts', description: 'Vertical clips and quick takes.' },
-      { id: 'remix', title: 'Remix', description: 'Reposts, stitches, and duets.' },
-      { id: 'fun', title: 'Fun', description: 'Funny clips and memes.' },
-    ],
-    video: [
-      { id: 'video', title: 'Videos', description: 'Long-form creator content.' },
-      { id: 'guides', title: 'Guides', description: 'Tutorials and how-tos.' },
-      { id: 'playlists', title: 'Playlists', description: 'Series and collections.' },
-    ],
-    live: [
-      { id: 'live', title: 'Live', description: 'Live rooms and stream chat.' },
-      { id: 'events', title: 'Events', description: 'Scheduled live sessions.' },
-      { id: 'backstage', title: 'Backstage', description: 'Creator and host prep.' },
-    ],
-  };
-
-  const defaultAvatar = (seed) => `https://api.dicebear.com/8.x/thumbs/svg?seed=${encodeURIComponent(seed || 'user')}`;
+  const el = (id) => document.getElementById(id);
 
   const state = {
+    tab: "feed",
+    server: localStorage.getItem("linkup_server") || "main",
+    channel: localStorage.getItem("linkup_channel") || "general",
+    clientId: localStorage.getItem("linkup_client_id") || ("cli_" + Math.random().toString(36).slice(2, 10)),
+    name: localStorage.getItem("linkup_name") || "You",
+    avatar: localStorage.getItem("linkup_avatar") || "",
+    bio: localStorage.getItem("linkup_bio") || "",
     socket: null,
     seq: 0,
     reconnectTimer: null,
-    handshakeTimer: null,
-    retryCount: 0,
     typingTimer: null,
-    localUserId: localStorage.getItem('linkup_user_id') || ('u_' + Math.random().toString(36).slice(2, 10)),
-    username: localStorage.getItem('linkup_username') || '',
-    displayName: localStorage.getItem('linkup_display_name') || '',
-    avatarUrl: localStorage.getItem('linkup_avatar') || '',
-    bio: localStorage.getItem('linkup_bio') || '',
-    server: localStorage.getItem('linkup_server') || 'global',
-    channel: localStorage.getItem('linkup_channel') || 'global',
-    mode: 'text',
     replyTo: null,
-    online: [],
-    bookmarks: [],
-    feedCache: [],
-    profile: null,
-    search: '',
+    data: {
+      feed: [],
+      messages: [],
+      users: [],
+      pins: [],
+      trending: [],
+    },
   };
 
-  localStorage.setItem('linkup_user_id', state.localUserId);
+  localStorage.setItem("linkup_client_id", state.clientId);
 
-  const els = {
-    servers: document.getElementById('servers'),
-    channels: document.getElementById('channels'),
-    feed: document.getElementById('feed'),
-    connState: document.getElementById('connState'),
-    roomLabel: document.getElementById('roomLabel'),
-    channelTitle: document.getElementById('channelTitle'),
-    channelDescription: document.getElementById('channelDescription'),
-    searchInput: document.getElementById('searchInput'),
-    composerText: document.getElementById('composerText'),
-    postBtn: document.getElementById('postBtn'),
-    modePost: document.getElementById('modePost'),
-    modeClip: document.getElementById('modeClip'),
-    modeVideo: document.getElementById('modeVideo'),
-    modeLive: document.getElementById('modeLive'),
-    modeLabel: document.getElementById('modeLabel'),
-    replyLabel: document.getElementById('replyLabel'),
-    typingLine: document.getElementById('typingLine'),
-    onlineList: document.getElementById('onlineList'),
-    bookmarksList: document.getElementById('bookmarksList'),
-    usernameInput: document.getElementById('usernameInput'),
-    displayNameInput: document.getElementById('displayNameInput'),
-    avatarInput: document.getElementById('avatarInput'),
-    bioInput: document.getElementById('bioInput'),
-    saveProfile: document.getElementById('saveProfile'),
-    randomAvatar: document.getElementById('randomAvatar'),
-    profilePic: document.getElementById('profilePic'),
-    profileName: document.getElementById('profileName'),
-    profileBio: document.getElementById('profileBio'),
-    youName: document.getElementById('youName'),
-    statPosts: document.getElementById('statPosts'),
-    statUsers: document.getElementById('statUsers'),
-    statFeed: document.getElementById('statFeed'),
-  };
+  const serverRail = el("servers");
+  const channelRail = el("channels");
+  const feedList = el("feedList");
+  const messagesList = el("messages");
+  const membersList = el("members");
+  const pinsList = el("pins");
+  const trendingList = el("trending");
 
-  function roomKey() { return `${state.server}:${state.channel}`; }
-  function clean(v) { return String(v || '').trim(); }
-  function escapeHtml(str) { return String(str).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[ch])); }
-  function timeText(ts) { return new Date(ts || Date.now()).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); }
-  function setStatus(text, ok = false) { els.connState.textContent = text; els.connState.style.color = ok ? '#d7ffe7' : ''; }
-
-  function setProfileFields(profile) {
-    els.usernameInput.value = profile?.username || state.username || '';
-    els.displayNameInput.value = profile?.display_name || state.displayName || '';
-    els.avatarInput.value = profile?.avatar_url || state.avatarUrl || '';
-    els.bioInput.value = profile?.bio || state.bio || '';
-    els.profilePic.src = profile?.avatar_url || state.avatarUrl || defaultAvatar(profile?.username || state.username || 'user');
-    els.profileName.textContent = profile?.display_name || profile?.username || 'Your profile';
-    els.profileBio.textContent = profile?.bio || 'Edit your name, avatar, and bio anytime.';
-    els.youName.textContent = profile?.display_name || profile?.username || 'You';
+  function esc(s) {
+    return String(s ?? "").replace(/[&<>"']/g, (m) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[m]));
   }
 
-  function saveLocalProfile(profile) {
-    if (!profile) return;
-    state.profile = profile;
-    state.username = profile.username || '';
-    state.displayName = profile.display_name || '';
-    state.avatarUrl = profile.avatar_url || '';
-    state.bio = profile.bio || '';
-    localStorage.setItem('linkup_username', state.username);
-    localStorage.setItem('linkup_display_name', state.displayName);
-    localStorage.setItem('linkup_avatar', state.avatarUrl);
-    localStorage.setItem('linkup_bio', state.bio);
-    setProfileFields(profile);
+  function ts(t) {
+    return new Date(t || Date.now()).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  }
+
+  function roomId() {
+    return `${state.server}:${state.channel}`;
+  }
+
+  function currentRoomName() {
+    return `#${state.channel}`;
+  }
+
+  function wsUrl() {
+    return `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/${encodeURIComponent(roomId())}`;
+  }
+
+  function setConn(text) {
+    el("connState").textContent = text;
+  }
+
+  function profilePayload() {
+    return {
+      kind: "profile",
+      client_id: state.clientId,
+      name: state.name,
+      avatar: state.avatar,
+      bio: state.bio,
+      room: roomId(),
+    };
+  }
+
+  function send(kind, payload) {
+    if (!state.socket || state.socket.readyState !== WebSocket.OPEN) return;
+    state.socket.send(JSON.stringify({ kind, client_id: state.clientId, room: roomId(), ...payload }));
+  }
+
+  function flattenSearch(item) {
+    return JSON.stringify(item).toLowerCase();
   }
 
   function renderServers() {
-    els.servers.innerHTML = servers.map(s => `<button class='srv ${s.id === state.server ? 'active' : ''}' data-server='${s.id}' title='${escapeHtml(s.label)}'>${escapeHtml(s.name)}</button>`).join('');
-    els.servers.querySelectorAll('button').forEach(btn => btn.onclick = () => {
-      const next = btn.dataset.server;
-      if (next === state.server) return;
-      state.server = next;
-      state.channel = channelsByServer[next][0].id;
-      localStorage.setItem('linkup_server', state.server);
-      localStorage.setItem('linkup_channel', state.channel);
-      connect(true);
-      renderShell();
-    });
-  }
-
-  function renderChannels() {
-    els.channels.innerHTML = (channelsByServer[state.server] || []).map(ch => `<button class='channel ${ch.id === state.channel ? 'active' : ''}' data-channel='${ch.id}'><div class='meta'><strong>${escapeHtml(ch.title)}</strong><span>${escapeHtml(ch.description)}</span></div><span class='badge'>#</span></button>`).join('');
-    els.channels.querySelectorAll('button').forEach(btn => btn.onclick = () => {
-      const next = btn.dataset.channel;
-      if (next === state.channel) return;
-      state.channel = next;
-      localStorage.setItem('linkup_channel', state.channel);
-      connect(true);
-      renderShell();
-    });
-  }
-
-  function renderTop() {
-    const ch = (channelsByServer[state.server] || []).find(x => x.id === state.channel) || channelsByServer[state.server][0];
-    els.roomLabel.textContent = `#${state.channel}`;
-    els.channelTitle.textContent = ch?.title || 'Global Feed';
-    els.channelDescription.textContent = ch?.description || 'Post updates, clips, and creator content.';
-  }
-
-  function normalizePost(post) {
-    if (!post) return post;
-    post.comments_list = post.comments_list || [];
-    return post;
-  }
-
-  function upsertFeed(feed) {
-    const map = new Map(state.feedCache.map(p => [p.post_id, p]));
-    for (const raw of (feed || [])) {
-      map.set(raw.post_id, normalizePost(raw));
-    }
-    state.feedCache = Array.from(map.values()).sort((a, b) => Number(b.created_at) - Number(a.created_at));
-    els.statPosts.textContent = `${state.feedCache.length} posts`;
-  }
-
-  function renderOnline(users) {
-    state.online = users || [];
-    els.statUsers.textContent = `${state.online.length} online`;
-    els.onlineList.innerHTML = state.online.length ? state.online.map(u => `<div class='item'><div><strong>${escapeHtml(u.display_name || u.username || 'user')}</strong><br><span>@${escapeHtml(u.username || 'user')}</span></div><button class='tiny' data-user='${escapeHtml(u.client_id)}'>Open</button></div>`).join('') : `<div class='item'><div><strong>No one yet</strong><br><span>Be the first online.</span></div></div>`;
-    els.onlineList.querySelectorAll('[data-user]').forEach(btn => btn.onclick = () => {
-      if (state.socket && state.socket.readyState === WebSocket.OPEN) {
-        state.socket.send(JSON.stringify({ kind: 'get_profile', user_id: btn.dataset.user, time: Date.now() }));
-      }
-    });
-  }
-
-  function renderBookmarks() {
-    const items = (state.bookmarks || []).map(id => state.feedCache.find(p => p.post_id === id)).filter(Boolean);
-    els.bookmarksList.innerHTML = items.length ? items.map(p => `<div class='item'><div><strong>${escapeHtml(p.author_name)}</strong><br><span>${escapeHtml((p.text || '').slice(0, 65))}</span></div><button class='tiny' data-jump='${escapeHtml(p.post_id)}'>Jump</button></div>`).join('') : `<div class='item'><div><strong>No bookmarks</strong><br><span>Save posts here.</span></div></div>`;
-    els.bookmarksList.querySelectorAll('[data-jump]').forEach(btn => btn.onclick = () => {
-      const target = els.feed.querySelector(`[data-post='${CSS.escape(btn.dataset.jump)}']`);
-      if (target) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-    });
-  }
-
-  function postHtml(post) {
-    const comments = (post.comments_list || []).slice(-3).map(c => `<div class='comment'><div class='who'>${escapeHtml(c.author_name)}</div><div>${escapeHtml(c.text)}</div></div>`).join('');
-    const media = post.media_url ? (post.media_type === 'video' || post.media_type === 'short' ? `<div class='media'><video controls playsinline src='${escapeHtml(post.media_url)}'></video></div>` : `<div class='media'><img src='${escapeHtml(post.media_url)}' alt='media'/></div>`) : '';
-    return `<article class='post' data-post='${escapeHtml(post.post_id)}'><div class='post-head'><div class='author'><img class='avatar' src='${escapeHtml(post._avatar || defaultAvatar(post.author_name))}' alt='avatar'/><div><strong>${escapeHtml(post.author_name)}</strong><span>${timeText(post.created_at)}</span></div></div><button class='tiny' data-action='bookmark' data-post='${escapeHtml(post.post_id)}'>Bookmark</button></div><div class='post-text'>${escapeHtml(post.text || '')}</div>${media}<div class='actions'><button class='tiny' data-action='like' data-post='${escapeHtml(post.post_id)}'>Like · ${post.likes || 0}</button><button class='tiny' data-action='comment' data-post='${escapeHtml(post.post_id)}'>Comment · ${post.comments || 0}</button><button class='tiny' data-action='repost' data-post='${escapeHtml(post.post_id)}'>Repost · ${post.reposts || 0}</button><button class='tiny' data-action='reply' data-post='${escapeHtml(post.post_id)}'>Reply</button><button class='tiny' data-action='pin' data-post='${escapeHtml(post.post_id)}'>Pin</button></div>${comments ? `<div class='comments'>${comments}</div>` : ''}</article>`;
-  }
-
-  function renderFeed() {
-    const q = clean(state.search).toLowerCase();
-    const items = q ? state.feedCache.filter(p => String(p.text || '').toLowerCase().includes(q) || String(p.author_name || '').toLowerCase().includes(q)) : state.feedCache;
-    els.feed.innerHTML = items.length ? items.map(postHtml).join('') : `<div class='post'><div class='muted'>No posts yet.</div></div>`;
-    els.statFeed.textContent = `${items.length} items`;
-    bindFeedActions();
-  }
-
-  function renderShell() {
-    renderServers();
-    renderChannels();
-    renderTop();
-    setProfileFields(state.profile || { username: state.username, display_name: state.displayName, avatar_url: state.avatarUrl, bio: state.bio });
-    renderOnline(state.online);
-    renderBookmarks();
-    renderFeed();
-  }
-
-  function wsUrl(room) {
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    return `${proto}://${location.host}/ws/${encodeURIComponent(room)}`;
-  }
-
-  function cleanupTimers() {
-    if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
-    if (state.handshakeTimer) clearTimeout(state.handshakeTimer);
-    state.reconnectTimer = null;
-    state.handshakeTimer = null;
-  }
-
-  function scheduleReconnect(seq) {
-    if (seq !== state.seq) return;
-    const delay = Math.min(1000 * Math.pow(2, state.retryCount), 10000);
-    state.retryCount += 1;
-    state.reconnectTimer = setTimeout(() => { if (seq === state.seq) connect(false); }, delay);
-    setStatus(`reconnecting in ${Math.ceil(delay / 1000)}s`);
-  }
-
-  function connect(force = false) {
-    cleanupTimers();
-    const seq = ++state.seq;
-    const room = roomKey();
-    let opened = false;
-
-    if (state.socket && (state.socket.readyState === WebSocket.OPEN || state.socket.readyState === WebSocket.CONNECTING)) {
-      try { state.socket.close(1000, 'switch'); } catch {}
-    }
-
-    setStatus('connecting...');
-    try {
-      state.socket = new WebSocket(wsUrl(room));
-    } catch (e) {
-      setStatus('socket unavailable');
-      scheduleReconnect(seq);
-      return;
-    }
-
-    state.handshakeTimer = setTimeout(() => { if (seq === state.seq && !opened) setStatus('connecting... still trying'); }, 3500);
-
-    state.socket.onopen = () => {
-      if (seq !== state.seq) return;
-      opened = true;
-      state.retryCount = 0;
-      cleanupTimers();
-      setStatus('connected', true);
-      state.socket.send(JSON.stringify({ kind: 'hello', user_id: state.localUserId, username: state.username, display_name: state.displayName, avatar_url: state.avatarUrl, bio: state.bio, room, time: Date.now() }));
-    };
-
-    state.socket.onclose = () => {
-      if (seq !== state.seq) return;
-      cleanupTimers();
-      setStatus(opened ? 'disconnected' : 'offline');
-      scheduleReconnect(seq);
-    };
-
-    state.socket.onerror = () => { if (seq === state.seq && !opened) setStatus('connection error'); };
-
-    state.socket.onmessage = (event) => {
-      if (seq !== state.seq) return;
-      let data = null;
-      try { data = JSON.parse(event.data); } catch { return; }
-
-      if (data.kind === 'init') {
-        if (data.profile) saveLocalProfile(data.profile);
-        upsertFeed(data.feed || []);
-        renderOnline(data.users || []);
-        state.bookmarks = state.bookmarks || [];
-        if (data.pins) state.bookmarks = state.bookmarks; // UI only for now
-        renderShell();
-        setStatus('connected', true);
-        return;
-      }
-
-      if (data.kind === 'presence') { renderOnline(data.users || []); return; }
-      if (data.kind === 'profile_update') { if (data.client_id === state.localUserId && data.profile) saveLocalProfile(data.profile); renderOnline(state.online.map(u => u.client_id === data.client_id ? { ...u, ...data.profile, profile: data.profile } : u)); renderShell(); return; }
-      if (data.kind === 'feed_data') { upsertFeed(data.feed || []); renderFeed(); return; }
-      if (data.kind === 'search_results') { upsertFeed(data.feed || []); renderFeed(); return; }
-      if (data.kind === 'feed_post') { upsertFeed([data.post]); renderFeed(); return; }
-      if (data.kind === 'comment_added') { const p = state.feedCache.find(x => x.post_id === data.post_id); if (p) { p.comments_list = p.comments_list || []; p.comments_list.push(data.comment); p.comments = (p.comments || 0) + 1; } renderFeed(); return; }
-      if (data.kind === 'like_update') { const p = state.feedCache.find(x => x.post_id === data.post_id); if (p) p.likes = data.likes || 0; renderFeed(); return; }
-      if (data.kind === 'pins_update') { renderShell(); return; }
-      if (data.kind === 'typing') { if (data.client_id !== state.localUserId) { els.typingLine.textContent = `${data.display_name || 'Someone'} is typing...`; clearTimeout(state.typingTimer); state.typingTimer = setTimeout(() => els.typingLine.textContent = '', 1200); } return; }
-    };
-  }
-
-  function bindFeedActions() {
-    els.feed.querySelectorAll('[data-action]').forEach(btn => {
+    serverRail.innerHTML = `
+      <div style="height:8px"></div>
+      ${["main", "work", "game", "study"].map((s) => `
+        <button class="serverbtn ${state.server === s ? "active" : ""}" data-server="${s}">${s.slice(0,1).toUpperCase()}</button>
+      `).join("")}
+    `;
+    serverRail.querySelectorAll(".serverbtn").forEach((btn) => {
       btn.onclick = () => {
-        if (!state.socket || state.socket.readyState !== WebSocket.OPEN) return;
-        const action = btn.dataset.action;
-        const postId = btn.dataset.post;
-        if (action === 'like') state.socket.send(JSON.stringify({ kind: 'like', post_id: postId, user_id: state.localUserId, time: Date.now() }));
-        if (action === 'comment') {
-          const text = prompt('Write a comment:');
-          if (text) state.socket.send(JSON.stringify({ kind: 'comment', post_id: postId, text, user_id: state.localUserId, time: Date.now() }));
-        }
-        if (action === 'repost') state.socket.send(JSON.stringify({ kind: 'repost', post_id: postId, user_id: state.localUserId, time: Date.now() }));
-        if (action === 'bookmark') {
-          state.socket.send(JSON.stringify({ kind: 'bookmark', post_id: postId, user_id: state.localUserId, time: Date.now() }));
-          if (!state.bookmarks.includes(postId)) state.bookmarks.push(postId); else state.bookmarks = state.bookmarks.filter(x => x !== postId);
-          renderBookmarks();
-          renderFeed();
-        }
-        if (action === 'reply') {
-          state.replyTo = postId;
-          const post = state.feedCache.find(p => p.post_id === postId);
-          els.replyLabel.style.display = 'inline-flex';
-          els.replyLabel.textContent = post ? `Replying to ${post.author_name}` : 'Replying';
-          els.composerText.focus();
-        }
-        if (action === 'pin') state.socket.send(JSON.stringify({ kind: 'pin', post_id: postId, user_id: state.localUserId, time: Date.now() }));
+        state.server = btn.dataset.server;
+        localStorage.setItem("linkup_server", state.server);
+        state.channel = "general";
+        localStorage.setItem("linkup_channel", state.channel);
+        renderAll();
+        connect();
       };
     });
   }
 
-  function bindProfileForm() {
-    els.saveProfile.onclick = () => {
-      if (!state.socket || state.socket.readyState !== WebSocket.OPEN) return;
-      const username = clean(els.usernameInput.value);
-      const displayName = clean(els.displayNameInput.value);
-      const avatarUrl = clean(els.avatarInput.value);
-      const bio = clean(els.bioInput.value);
-      if (username) state.socket.send(JSON.stringify({ kind: 'set_username', username, display_name: displayName || username, time: Date.now() }));
-      if (displayName) state.socket.send(JSON.stringify({ kind: 'set_display_name', display_name: displayName, time: Date.now() }));
-      if (avatarUrl) state.socket.send(JSON.stringify({ kind: 'set_avatar', avatar_url: avatarUrl, time: Date.now() }));
-      state.socket.send(JSON.stringify({ kind: 'set_bio', bio, time: Date.now() }));
-      state.username = username || state.username;
-      state.displayName = displayName || state.displayName;
-      state.avatarUrl = avatarUrl || state.avatarUrl;
-      state.bio = bio;
-      localStorage.setItem('linkup_username', state.username);
-      localStorage.setItem('linkup_display_name', state.displayName);
-      localStorage.setItem('linkup_avatar', state.avatarUrl);
-      localStorage.setItem('linkup_bio', state.bio);
-      setProfileFields({ username: state.username, display_name: state.displayName, avatar_url: state.avatarUrl, bio: state.bio });
+  function renderChannels() {
+    channelRail.innerHTML = `
+      <div class="sectiontitle">Channels</div>
+      ${rooms.map((r) => `
+        <button class="channel ${state.channel === r.id ? "active" : ""}" data-channel="${r.id}">
+          <div class="meta"><strong># ${esc(r.name)}</strong><span>${esc(r.desc)}</span></div>
+          <span class="badge">#</span>
+        </button>
+      `).join("")}
+    `;
+    channelRail.querySelectorAll(".channel").forEach((btn) => {
+      btn.onclick = () => {
+        state.channel = btn.dataset.channel;
+        localStorage.setItem("linkup_channel", state.channel);
+        renderAll();
+        connect();
+      };
+    });
+  }
+
+  function feedFiltered() {
+    const q = el("searchInput").value.trim().toLowerCase();
+    return !q ? state.data.feed : state.data.feed.filter((p) => flattenSearch(p).includes(q));
+  }
+
+  function chatFiltered() {
+    const q = el("searchInput").value.trim().toLowerCase();
+    return !q ? state.data.messages : state.data.messages.filter((m) => flattenSearch(m).includes(q));
+  }
+
+  function renderFeed() {
+    feedList.innerHTML = feedFiltered().map((p) => {
+      const comments = (p.comments || []).slice(-3).map((c) => `
+        <div style="margin-top:8px;padding:8px 10px;border-radius:8px;background:#1e1f22">
+          <b style="font-size:13px">${esc(c.name)}</b>
+          <div style="color:#b5bac1;font-size:12px;margin-top:2px">${esc(c.text)}</div>
+        </div>
+      `).join("");
+
+      const media =
+        p.media_url
+          ? (
+              p.media_type === "video" || /\.(mp4|webm|mov|m4v)(\?.*)?$/i.test(p.media_url)
+                ? `<div class="media"><video controls src="${esc(p.media_url)}"></video></div>`
+                : `<div class="media"><img src="${esc(p.media_url)}" alt=""></div>`
+            )
+          : "";
+
+      return `
+        <div class="post" data-post="${esc(p.id)}">
+          <div class="posthead">
+            <div class="person">
+              ${p.avatar ? `<img class="avatarimg" src="${esc(p.avatar)}" alt="">` : `<div class="avatar">${esc((p.name || "?").slice(0,1).toUpperCase())}</div>`}
+              <div>
+                <b>${esc(p.name || "Guest")}</b>
+                <span>${ts(p.created_at)} · ${esc(p.bio || "")}</span>
+              </div>
+            </div>
+          </div>
+          <div class="posttext">${esc(p.text || "")}</div>
+          ${media}
+          <div class="actions">
+            <button class="chip" data-pact="like" data-id="${esc(p.id)}">Like ${p.likes || 0}</button>
+            <button class="chip" data-pact="repost" data-id="${esc(p.id)}">Repost ${p.reposts || 0}</button>
+            <button class="chip" data-pact="comment" data-id="${esc(p.id)}">Comment ${p.comments?.length || 0}</button>
+          </div>
+          ${comments}
+        </div>
+      `;
+    }).join("");
+    bindFeedActions();
+  }
+
+  function renderMessages() {
+    messagesList.innerHTML = chatFiltered().map((m) => {
+      const reacts = Object.entries(m.reactions || {}).map(([e, n]) => `<span class="badge">${esc(e)} ${n}</span>`).join(" ");
+      return `
+        <div class="msgbox" data-id="${esc(m.msg_id)}">
+          <div class="msghead">
+            <div class="person">
+              ${m.avatar ? `<img class="avatarimg" src="${esc(m.avatar)}" alt="">` : `<div class="avatar">${esc((m.name || "?").slice(0,1).toUpperCase())}</div>`}
+              <div>
+                <b>${esc(m.name || "Guest")}</b>
+                <span>${ts(m.created_at)}</span>
+              </div>
+            </div>
+            <span class="stamp">${m.pinned ? "pinned" : ""}</span>
+          </div>
+          ${m.reply_preview ? `<div class="replybox">Replying to <b>${esc(m.reply_preview.name)}</b><br>${esc(m.reply_preview.text)}</div>` : ""}
+          <div class="msgtext">${esc(m.text || "")}</div>
+          <div class="actions">
+            <button class="chip" data-act="reply" data-id="${esc(m.msg_id)}">Reply</button>
+            <button class="chip" data-act="pin" data-id="${esc(m.msg_id)}">${m.pinned ? "Unpin" : "Pin"}</button>
+            <button class="chip" data-act="react" data-id="${esc(m.msg_id)}">React</button>
+            ${reacts}
+          </div>
+        </div>
+      `;
+    }).join("");
+    bindMessageActions();
+    el("statMessages")?.textContent = String(state.data.messages.length);
+  }
+
+  function renderMembers() {
+    membersList.innerHTML = (state.data.users || []).map((u) => `
+      <div class="user">
+        <div class="left">
+          <strong>${esc(u.name)}</strong>
+          <span>${esc(u.bio || "online")}</span>
+        </div>
+        <span class="badge">live</span>
+      </div>
+    `).join("") || `<div class="smallnote">No one here yet.</div>`;
+  }
+
+  function renderPins() {
+    pinsList.innerHTML = (state.data.pins || []).slice().reverse().map((p) => `
+      <div class="pill2" data-pin="${esc(p.id)}">${esc(p.name)}: ${esc((p.text || "").slice(0, 60))}</div>
+    `).join("") || `<div class="pill2">No pins yet</div>`;
+
+    pinsList.querySelectorAll("[data-pin]").forEach((node) => {
+      node.onclick = () => {
+        const target = messagesList.querySelector(`[data-id="${CSS.escape(node.dataset.pin)}"]`);
+        if (target) target.scrollIntoView({ behavior: "smooth", block: "center" });
+      };
+    });
+  }
+
+  function renderTrending() {
+    trendingList.innerHTML = (state.data.trending || []).map((p) => `
+      <div class="user">
+        <div class="left">
+          <strong>${esc(p.name)}</strong>
+          <span>${esc((p.text || "").slice(0, 55))}</span>
+        </div>
+        <span class="badge">${(p.likes || 0) + (p.reposts || 0)}</span>
+      </div>
+    `).join("") || `<div class="smallnote">Nothing trending yet.</div>`;
+  }
+
+  function renderProfileFields() {
+    el("nameInput").value = state.name;
+    el("avatarInput").value = state.avatar;
+    el("bioInput").value = state.bio;
+  }
+
+  function renderTop() {
+    el("roomLabel").textContent = currentRoomName();
+    el("channelTitle").textContent = `# ${state.channel}`;
+    el("channelDescription").textContent =
+      state.tab === "feed"
+        ? "A timeline for posts, clips, and updates."
+        : "A roomy live chat with smooth scrolling.";
+  }
+
+  function renderTabs() {
+    document.querySelectorAll(".tab").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.tab === state.tab);
+    });
+    el("feedPane").classList.toggle("active", state.tab === "feed");
+    el("chatPane").classList.toggle("active", state.tab === "chat");
+  }
+
+  function renderAll() {
+    renderServers();
+    renderChannels();
+    renderTop();
+    renderTabs();
+    renderProfileFields();
+    renderFeed();
+    renderMessages();
+    renderMembers();
+    renderPins();
+    renderTrending();
+  }
+
+  function connect() {
+    const seq = ++state.seq;
+
+    if (state.socket && (state.socket.readyState === WebSocket.OPEN || state.socket.readyState === WebSocket.CONNECTING)) {
+      try { state.socket.close(1000, "switch"); } catch {}
+    }
+
+    clearTimeout(state.reconnectTimer);
+    setConn("connecting...");
+
+    state.socket = new WebSocket(wsUrl());
+
+    state.socket.onopen = () => {
+      if (seq !== state.seq) return;
+      setConn("connected");
+      state.socket.send(JSON.stringify({
+        kind: "hello",
+        client_id: state.clientId,
+        room: roomId(),
+        name: state.name,
+        avatar: state.avatar,
+        bio: state.bio,
+      }));
     };
-    els.randomAvatar.onclick = () => { els.avatarInput.value = defaultAvatar((els.usernameInput.value || els.displayNameInput.value || state.username || 'user') + '_' + Math.random().toString(36).slice(2, 6)); };
-  }
 
-  function bindComposer() {
-    els.postBtn.onclick = () => {
-      const text = clean(els.composerText.value);
-      if (!text || !state.socket || state.socket.readyState !== WebSocket.OPEN) return;
-      const mediaType = state.mode === 'short' ? 'short' : state.mode === 'video' ? 'video' : state.mode === 'live' ? 'live' : 'text';
-      state.socket.send(JSON.stringify({ kind: 'room_post', user_id: state.localUserId, text, media_type: mediaType, visibility: 'public', time: Date.now() }));
-      els.composerText.value = '';
-      state.replyTo = null;
-      els.replyLabel.style.display = 'none';
+    state.socket.onmessage = (e) => {
+      if (seq !== state.seq) return;
+      const data = JSON.parse(e.data);
+
+      if (data.kind === "init") {
+        state.data.users = data.users || [];
+        state.data.messages = data.history || [];
+        state.data.pins = data.pins || [];
+        state.data.feed = data.feed || [];
+        state.data.trending = data.feed_trending || [];
+        renderAll();
+        return;
+      }
+
+      if (data.kind === "presence") {
+        state.data.users = data.users || [];
+        renderMembers();
+        return;
+      }
+
+      if (data.kind === "profile_update") {
+        const p = data.profile || {};
+        const idx = (state.data.users || []).findIndex((u) => u.client_id === p.client_id);
+        if (idx >= 0) state.data.users[idx] = p;
+        else state.data.users = [...(state.data.users || []), p];
+        renderMembers();
+        renderTrending();
+        return;
+      }
+
+      if (data.kind === "chat_message") {
+        state.data.messages.push(data.message);
+        renderMessages();
+        return;
+      }
+
+      if (data.kind === "pin_update") {
+        state.data.pins = data.pins || [];
+        const m = state.data.messages.find((x) => x.msg_id === data.message?.msg_id);
+        if (m) m.pinned = data.action === "pinned";
+        renderPins();
+        renderMessages();
+        return;
+      }
+
+      if (data.kind === "reaction_update") {
+        const m = state.data.messages.find((x) => x.msg_id === data.msg_id);
+        if (m) m.reactions = data.reactions || {};
+        renderMessages();
+        return;
+      }
+
+      if (data.kind === "feed_post") {
+        state.data.feed.unshift(data.post);
+        renderFeed();
+        renderTrending();
+        return;
+      }
+
+      if (data.kind === "feed_update") {
+        const idx = state.data.feed.findIndex((p) => p.id === data.post.id);
+        if (idx >= 0) state.data.feed[idx] = data.post;
+        else state.data.feed.unshift(data.post);
+        renderFeed();
+        renderTrending();
+        return;
+      }
+
+      if (data.kind === "typing") {
+        el("channelDescription").textContent = `${data.name || "Someone"} is typing...`;
+        clearTimeout(state.typingTimer);
+        state.typingTimer = setTimeout(renderTop, 900);
+      }
     };
-    els.composerText.addEventListener('keydown', e => {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); els.postBtn.click(); }
+
+    state.socket.onerror = () => {
+      if (seq !== state.seq) return;
+      setConn("connection error");
+    };
+
+    state.socket.onclose = () => {
+      if (seq !== state.seq) return;
+      setConn("offline");
+      state.reconnectTimer = setTimeout(() => connect(), 1200);
+    };
+  }
+
+  function bindMessageActions() {
+    messagesList.querySelectorAll("[data-act]").forEach((btn) => {
+      btn.onclick = () => {
+        const id = btn.dataset.id;
+        const act = btn.dataset.act;
+
+        if (act === "reply") {
+          state.replyTo = id;
+          const original = state.data.messages.find((m) => m.msg_id === id);
+          el("messageInput").placeholder = original ? `Replying to ${original.name}...` : "Replying...";
+          el("messageInput").focus();
+          return;
+        }
+
+        if (act === "pin") {
+          return send("pin_chat", { msg_id: id });
+        }
+
+        if (act === "react") {
+          const emoji = prompt("Reaction", "👍");
+          if (emoji) send("react_chat", { msg_id: id, emoji });
+        }
+      };
     });
-    els.composerText.addEventListener('input', () => {
-      if (state.socket && state.socket.readyState === WebSocket.OPEN) state.socket.send(JSON.stringify({ kind: 'typing', display_name: state.displayName || state.username || 'User', time: Date.now() }));
+  }
+
+  function bindFeedActions() {
+    feedList.querySelectorAll("[data-pact]").forEach((btn) => {
+      btn.onclick = () => {
+        const id = btn.dataset.id;
+        const act = btn.dataset.pact;
+
+        if (act === "like") return send("feed_like", { post_id: id });
+        if (act === "repost") return send("feed_repost", { post_id: id });
+        if (act === "comment") {
+          const text = prompt("Write a comment");
+          if (text) send("feed_comment", { post_id: id, text });
+        }
+      };
     });
-    els.modePost.onclick = () => { state.mode = 'text'; els.modeLabel.textContent = 'Post mode'; };
-    els.modeClip.onclick = () => { state.mode = 'short'; els.modeLabel.textContent = 'Short mode'; };
-    els.modeVideo.onclick = () => { state.mode = 'video'; els.modeLabel.textContent = 'Video mode'; };
-    els.modeLive.onclick = () => { state.mode = 'live'; els.modeLabel.textContent = 'Live mode'; };
   }
 
-  function bindSearch() {
-    els.searchInput.addEventListener('input', () => {
-      state.search = els.searchInput.value;
-      renderFeed();
-      if (state.socket && state.socket.readyState === WebSocket.OPEN) state.socket.send(JSON.stringify({ kind: 'search_posts', query: state.search, time: Date.now() }));
-    });
-  }
+  document.querySelectorAll(".tab").forEach((btn) => {
+    btn.onclick = () => {
+      state.tab = btn.dataset.tab;
+      renderTabs();
+    };
+  });
 
-  function initLocalProfile() {
-    const username = state.username || ('user_' + state.localUserId.slice(-4));
-    const displayName = state.displayName || username;
-    const avatarUrl = state.avatarUrl || defaultAvatar(username);
-    saveLocalProfile({ user_id: state.localUserId, username, display_name: displayName, avatar_url: avatarUrl, bio: state.bio || '', followers: 0, following: 0, posts: 0, created_at: Date.now() });
-  }
+  el("profileBtn").onclick = () => {
+    state.name = (el("nameInput").value || "You").trim().slice(0, 24) || "You";
+    state.avatar = (el("avatarInput").value || "").trim();
+    state.bio = (el("bioInput").value || "").trim().slice(0, 80);
 
-  function bootstrap() {
-    initLocalProfile();
-    bindComposer();
-    bindSearch();
-    bindProfileForm();
-    renderShell();
-    setStatus('connecting...');
-    connect(true);
-  }
+    localStorage.setItem("linkup_name", state.name);
+    localStorage.setItem("linkup_avatar", state.avatar);
+    localStorage.setItem("linkup_bio", state.bio);
 
-  bootstrap();
+    send("profile", { name: state.name, avatar: state.avatar, bio: state.bio });
+    renderProfileFields();
+  };
+
+  el("postBtn").onclick = () => {
+    const text = el("postText").value.trim();
+    const media_url = el("mediaUrl").value.trim();
+    const media_type = el("mediaType").value;
+
+    if (!text && !media_url) return;
+
+    send("post", { text, media_url, media_type });
+    el("postText").value = "";
+    el("mediaUrl").value = "";
+  };
+
+  el("sendBtn").onclick = () => {
+    const text = el("messageInput").value.trim();
+    if (!text) return;
+
+    send("chat", { text, reply_to: state.replyTo });
+    state.replyTo = null;
+    el("messageInput").placeholder = "Message LinkUp...";
+    el("messageInput").value = "";
+  };
+
+  el("clearReplyBtn").onclick = () => {
+    state.replyTo = null;
+    el("messageInput").placeholder = "Message LinkUp...";
+  };
+
+  el("messageInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      el("sendBtn").click();
+    }
+  });
+
+  el("postText").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && e.ctrlKey) {
+      e.preventDefault();
+      el("postBtn").click();
+    }
+  });
+
+  el("searchInput").addEventListener("input", () => {
+    if (state.tab === "feed") renderFeed();
+    else renderMessages();
+  });
+
+  el("messageInput").addEventListener("input", () => {
+    send("typing", {});
+  });
+
+  renderAll();
+  connect();
 })();
-</script></body>
+</script>
+</body>
 </html>"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def root():
+    return HTMLResponse(page_html())
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "app": "LinkUp"}
+
+
+@app.get("/api")
+def api():
+    return {"message": "LinkUp is live", "websocket": "/ws/{room_id}"}
+
+
+@app.get("/{path:path}")
+def spa(path: str):
+    return HTMLResponse(page_html())
 
 
 
