@@ -13,6 +13,9 @@ from fastapi.responses import HTMLResponse
 
 app = FastAPI(title="LinkUp")
 
+# ----------------------------
+# Config
+# ----------------------------
 
 class Settings:
     def __init__(self) -> None:
@@ -32,14 +35,14 @@ app.add_middleware(
 
 ws_router = APIRouter()
 
-ROOM_META = [
+ROOMS_META = [
     {"id": "general", "name": "general", "desc": "Town square for everything."},
     {"id": "dev", "name": "dev", "desc": "Builds, bugs, and code."},
     {"id": "clips", "name": "clips", "desc": "Short clips and highlights."},
     {"id": "study", "name": "study", "desc": "Focus, notes, learning."},
 ]
 
-SEARCH_SUGGESTIONS = ["#python", "#games", "#art", "#music", "#ai", "#clips", "#buildinpublic"]
+SEARCH_HINTS = ["#python", "#games", "#art", "#music", "#ai", "#clips", "#buildinpublic"]
 
 
 def now_ms() -> int:
@@ -110,6 +113,10 @@ def serialize_message(msg: dict) -> dict:
     }
 
 
+# ----------------------------
+# Global feed state
+# ----------------------------
+
 FEED: List[dict] = []
 FEED_INDEX: Dict[str, dict] = {}
 
@@ -163,6 +170,10 @@ def trending_posts() -> List[dict]:
     )
     return [serialize_post(p) for p in ranked[:8]]
 
+
+# ----------------------------
+# Room state
+# ----------------------------
 
 class RoomState:
     def __init__(self) -> None:
@@ -241,9 +252,26 @@ class RoomState:
         msg["reactions"] = {e: len(users) for e, users in self.reactions[room][msg_id].items()}
         return {"msg_id": msg_id, "reactions": msg["reactions"]}
 
+    async def broadcast_room(self, room: str, payload: dict) -> None:
+        dead = []
+        for cid, ws in self.sockets[room].items():
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                dead.append(cid)
+        for cid in dead:
+            self.remove(room, cid)
+
+    async def broadcast_all(self, payload: dict) -> None:
+        for room in list(self.sockets.keys()):
+            await self.broadcast_room(room, payload)
+
 
 ROOMS = RoomState()
 
+# ----------------------------
+# Profiles
+# ----------------------------
 
 PROFILES: Dict[str, dict] = {}
 
@@ -260,6 +288,10 @@ def get_profile(client_id: str) -> dict:
         }
     return PROFILES[client_id]
 
+
+# ----------------------------
+# Push helpers
+# ----------------------------
 
 async def push_presence(room: str) -> None:
     await ROOMS.broadcast_room(
@@ -283,20 +315,20 @@ async def push_profile(profile: dict) -> None:
     )
 
 
-async def push_feed_update(post: dict) -> None:
+async def push_feed_post(post: dict) -> None:
     await ROOMS.broadcast_all(
         {
-            "kind": "feed_update",
+            "kind": "feed_post",
             "post": serialize_post(post),
             "time": now_ms(),
         }
     )
 
 
-async def push_feed_post(post: dict) -> None:
+async def push_feed_update(post: dict) -> None:
     await ROOMS.broadcast_all(
         {
-            "kind": "feed_post",
+            "kind": "feed_update",
             "post": serialize_post(post),
             "time": now_ms(),
         }
@@ -370,10 +402,10 @@ async def push_init(room: str, ws: WebSocket, client_id: str) -> None:
             "users": ROOMS.users(room),
             "history": ROOMS.history_view(room),
             "pins": ROOMS.pins_view(room),
-            "feed": [serialize_post(p) for p in FEED][-60:],
+            "feed": [serialize_post(p) for p in FEED][-80:],
             "feed_trending": trending_posts(),
-            "rooms": ROOM_META,
-            "suggestions": SEARCH_SUGGESTIONS,
+            "rooms": ROOMS_META,
+            "suggestions": SEARCH_HINTS,
             "time": now_ms(),
         }
     )
@@ -383,26 +415,9 @@ async def push_pong(ws: WebSocket) -> None:
     await ws.send_json({"kind": "pong", "time": now_ms()})
 
 
-async def push_all_profile(profile: dict) -> None:
-    await ROOMS.broadcast_all(
-        {
-            "kind": "profile_update",
-            "profile": serialize_profile(profile),
-            "time": now_ms(),
-        }
-    )
-
-
-async def push_all_feed() -> None:
-    await ROOMS.broadcast_all(
-        {
-            "kind": "feed_snapshot",
-            "feed": [serialize_post(p) for p in FEED][-80:],
-            "feed_trending": trending_posts(),
-            "time": now_ms(),
-        }
-    )
-
+# ----------------------------
+# Action handlers
+# ----------------------------
 
 async def set_identity(room: str, client_id: str, name: str, avatar: str, bio: str, ws: WebSocket) -> dict:
     profile = get_profile(client_id)
@@ -525,6 +540,10 @@ async def handle_feed_comment(profile: dict, data: dict) -> None:
     await push_feed_update(post)
 
 
+# ----------------------------
+# WebSocket
+# ----------------------------
+
 @ws_router.websocket("/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):
     await websocket.accept()
@@ -532,13 +551,11 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
     client_id = "cli_" + uuid4().hex[:10]
     profile = get_profile(client_id)
     active_room = room_id
-
-    ping_at = now_ms()
+    connected = False
 
     try:
         while True:
             raw = await websocket.receive_text()
-            ping_at = now_ms()
 
             try:
                 data = json.loads(raw)
@@ -565,6 +582,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 )
                 active_room = str(data.get("room") or room_id)
 
+                if not connected:
+                    connected = True
+
                 await push_init(active_room, websocket, client_id)
                 await push_presence(active_room)
                 await push_profile(profile)
@@ -580,13 +600,10 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     str(data.get("bio") or profile.get("bio") or ""),
                     websocket,
                 )
-
                 await push_profile(profile)
-
-                if active_room:
-                    await push_presence(active_room)
-                    if old_name != profile["name"]:
-                        await push_system(active_room, f"{old_name} is now {profile['name']}")
+                await push_presence(active_room)
+                if old_name != profile["name"]:
+                    await push_system(active_room, f"{old_name} is now {profile['name']}")
                 continue
 
             if kind == "typing":
@@ -638,25 +655,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
         await push_presence(active_room)
 
 
-class SafeBroadcastMixin:
-    async def broadcast_room(self, room: str, payload: dict) -> None:
-        dead = []
-        for cid, ws in self.sockets[room].items():
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                dead.append(cid)
-        for cid in dead:
-            self.remove(room, cid)
-
-    async def broadcast_all(self, payload: dict) -> None:
-        for room in list(self.sockets.keys()):
-            await self.broadcast_room(room, payload)
-
-
-RoomState.broadcast_room = SafeBroadcastMixin.broadcast_room
-RoomState.broadcast_all = SafeBroadcastMixin.broadcast_all
-
+# ----------------------------
+# Routes
+# ----------------------------
 
 @app.get("/", response_class=HTMLResponse)
 def root():
@@ -678,6 +679,10 @@ def spa(path: str):
     return HTMLResponse(page_html())
 
 
+# ----------------------------
+# UI
+# ----------------------------
+
 def page_html() -> str:
     return """<!doctype html>
 <html lang="en">
@@ -687,8 +692,14 @@ def page_html() -> str:
 <title>LinkUp</title>
 <style>
 :root{
-  --bg:#313338; --panel:#2b2d31; --panel2:#1e1f22; --text:#f2f3f5; --muted:#b5bac1;
-  --accent:#5865f2; --accent2:#3ba55d; --line:rgba(255,255,255,.06);
+  --bg:#313338;
+  --panel:#2b2d31;
+  --panel2:#1e1f22;
+  --text:#f2f3f5;
+  --muted:#b5bac1;
+  --accent:#5865f2;
+  --accent2:#3ba55d;
+  --line:rgba(255,255,255,.06);
 }
 *{box-sizing:border-box}
 html,body{height:100%}
@@ -719,7 +730,8 @@ button,input,textarea,select{font:inherit}
   gap:10px;
 }
 .serverbtn{
-  width:48px;height:48px;
+  width:48px;
+  height:48px;
   border:none;
   border-radius:16px;
   background:#383a40;
@@ -860,7 +872,9 @@ button,input,textarea,select{font:inherit}
   flex:0 0 auto;
 }
 .dot{
-  width:10px;height:10px;border-radius:999px;
+  width:10px;
+  height:10px;
+  border-radius:999px;
   background:var(--accent2);
   box-shadow:0 0 0 4px rgba(59,165,93,.1);
 }
@@ -1400,7 +1414,6 @@ button,input,textarea,select{font:inherit}
       `;
     }).join("");
     bindMessageActions();
-    el("statMessages").textContent = String(state.data.messages.length);
   }
 
   function renderMembers() {
@@ -1476,9 +1489,19 @@ button,input,textarea,select{font:inherit}
     renderTrending();
   }
 
+  function optimisticAddChat(msg) {
+    state.data.messages.push(msg);
+    renderMessages();
+  }
+
+  function optimisticAddPost(post) {
+    state.data.feed.unshift(post);
+    renderFeed();
+    renderTrending();
+  }
+
   function connect() {
     const seq = ++state.seq;
-    state.connectedOnce = false;
 
     if (state.socket && (state.socket.readyState === WebSocket.OPEN || state.socket.readyState === WebSocket.CONNECTING)) {
       try { state.socket.close(1000, "switch"); } catch {}
@@ -1504,16 +1527,12 @@ button,input,textarea,select{font:inherit}
         bio: state.bio,
       }));
 
-      state.reconnectTimer = setInterval(() => {
-        if (state.socket && state.socket.readyState === WebSocket.OPEN) {
-          state.socket.send(JSON.stringify({
-            kind: "ping",
-            client_id: state.clientId,
-            room: roomId(),
-            time: Date.now()
-          }));
-        }
-      }, 20000);
+      state.socket.send(JSON.stringify({
+        kind: "ping",
+        client_id: state.clientId,
+        room: roomId(),
+        time: Date.now(),
+      }));
     };
 
     state.socket.onmessage = (e) => {
@@ -1554,8 +1573,10 @@ button,input,textarea,select{font:inherit}
       }
 
       if (data.kind === "chat_message") {
-        state.data.messages.push(data.message);
-        renderMessages();
+        if (!state.data.messages.some((m) => m.msg_id === data.message.msg_id)) {
+          state.data.messages.push(data.message);
+          renderMessages();
+        }
         return;
       }
 
@@ -1576,9 +1597,11 @@ button,input,textarea,select{font:inherit}
       }
 
       if (data.kind === "feed_post") {
-        state.data.feed.unshift(data.post);
-        renderFeed();
-        renderTrending();
+        if (!state.data.feed.some((p) => p.id === data.post.id)) {
+          state.data.feed.unshift(data.post);
+          renderFeed();
+          renderTrending();
+        }
         return;
       }
 
@@ -1591,17 +1614,8 @@ button,input,textarea,select{font:inherit}
         return;
       }
 
-      if (data.kind === "feed_snapshot") {
-        state.data.feed = data.feed || state.data.feed;
-        state.data.trending = data.feed_trending || state.data.trending;
-        renderFeed();
-        renderTrending();
-        return;
-      }
-
       if (data.kind === "typing") {
-        const desc = currentRoomName() + " • " + (data.name || "Someone") + " is typing...";
-        el("channelDescription").textContent = desc;
+        el("channelDescription").textContent = currentRoomName() + " • " + (data.name || "Someone") + " is typing...";
         clearTimeout(state.typingTimer);
         state.typingTimer = setTimeout(renderTop, 900);
         return;
@@ -1633,7 +1647,6 @@ button,input,textarea,select{font:inherit}
 
     state.socket.onclose = () => {
       if (seq !== state.seq) return;
-      clearInterval(state.reconnectTimer);
       setConn(state.connectedOnce ? "disconnected" : "offline");
       state.reconnectTimer = setTimeout(() => connect(), 1200);
     };
@@ -1654,6 +1667,7 @@ button,input,textarea,select{font:inherit}
         }
 
         if (act === "pin") return send("pin_chat", { msg_id: id });
+
         if (act === "react") {
           const emoji = prompt("Reaction", "👍");
           if (emoji) send("react_chat", { msg_id: id, emoji });
@@ -1667,6 +1681,7 @@ button,input,textarea,select{font:inherit}
       btn.onclick = () => {
         const id = btn.dataset.id;
         const act = btn.dataset.pact;
+
         if (act === "like") return send("feed_like", { post_id: id });
         if (act === "repost") return send("feed_repost", { post_id: id });
         if (act === "comment") {
@@ -1704,7 +1719,24 @@ button,input,textarea,select{font:inherit}
 
     if (!text && !media_url) return;
 
+    const post = {
+      id: `local_post_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+      client_id: state.clientId,
+      name: state.name,
+      avatar: state.avatar,
+      bio: state.bio,
+      text,
+      media_url,
+      media_type,
+      created_at: Date.now(),
+      likes: 0,
+      reposts: 0,
+      comments: [],
+    };
+
+    optimisticAddPost(post);
     send("post", { text, media_url, media_type });
+
     el("postText").value = "";
     el("mediaUrl").value = "";
   };
@@ -1713,10 +1745,28 @@ button,input,textarea,select{font:inherit}
     const text = el("messageInput").value.trim();
     if (!text) return;
 
+    const original = state.replyTo ? state.data.messages.find((m) => m.msg_id === state.replyTo) : null;
+    const msg = {
+      msg_id: `local_msg_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
+      client_id: state.clientId,
+      name: state.name,
+      avatar: state.avatar,
+      text,
+      room: roomId(),
+      created_at: Date.now(),
+      reply_to: state.replyTo || null,
+      reply_preview: original ? { msg_id: original.msg_id, name: original.name, text: original.text } : null,
+      reactions: {},
+      pinned: false,
+    };
+
+    optimisticAddChat(msg);
     send("chat", { text, reply_to: state.replyTo });
+
     state.replyTo = null;
     el("messageInput").placeholder = "Message LinkUp...";
     el("messageInput").value = "";
+    el("messageInput").style.height = "96px";
   };
 
   el("clearReplyBtn").onclick = () => {
@@ -1745,6 +1795,14 @@ button,input,textarea,select{font:inherit}
 
   el("messageInput").addEventListener("input", () => {
     send("typing", {});
+  });
+
+  window.addEventListener("beforeunload", () => {
+    try {
+      if (state.socket && state.socket.readyState === WebSocket.OPEN) {
+        state.socket.close(1000, "bye");
+      }
+    } catch {}
   });
 
   renderAll();
