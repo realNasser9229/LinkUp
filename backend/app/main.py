@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse
 
 app = FastAPI(title="LinkUp")
 
+
 # ----------------------------
 # Config
 # ----------------------------
@@ -90,6 +91,7 @@ def serialize_post(post: dict) -> dict:
         "text": post.get("text", ""),
         "media_url": post.get("media_url", ""),
         "media_type": post.get("media_type", "text"),
+        "media_name": post.get("media_name", ""),
         "created_at": post.get("created_at", now_ms()),
         "likes": len(post.get("likes", set())),
         "reposts": len(post.get("reposts", set())),
@@ -134,6 +136,7 @@ def seed_feed() -> None:
             "text": "Welcome to LinkUp — a hybrid timeline + live rooms app.",
             "media_url": "",
             "media_type": "text",
+            "media_name": "",
         },
         {
             "client_id": "seed_nova",
@@ -143,6 +146,7 @@ def seed_feed() -> None:
             "text": "You can post updates here and still jump into live rooms below.",
             "media_url": "",
             "media_type": "text",
+            "media_name": "",
         },
     ]
 
@@ -466,6 +470,7 @@ async def handle_post(profile: dict, data: dict) -> None:
     text = clamp_text(str(data.get("text") or ""), 5000)
     media_url = str(data.get("media_url") or "").strip()
     media_type = str(data.get("media_type") or "text").strip()
+    media_name = str(data.get("media_name") or "").strip()
 
     if not text and not media_url:
         return
@@ -479,6 +484,7 @@ async def handle_post(profile: dict, data: dict) -> None:
         "text": text,
         "media_url": media_url,
         "media_type": media_type,
+        "media_name": media_name,
         "created_at": int(data.get("created_at") or now_ms()),
         "likes": set(),
         "reposts": set(),
@@ -1039,6 +1045,11 @@ button,input,textarea,select{font:inherit}
   max-height:440px;
   object-fit:cover;
 }
+.media.compact{
+  padding:12px;
+  background:rgba(255,255,255,.04);
+  border:1px solid var(--line);
+}
 .actions{
   display:flex;
   gap:8px;
@@ -1112,6 +1123,47 @@ button,input,textarea,select{font:inherit}
   gap:10px;
   flex-wrap:wrap;
   margin-top:8px;
+}
+.toggle{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  font-size:12px;
+  color:var(--muted);
+}
+.previewframe{
+  margin-top:10px;
+  border-radius:12px;
+  overflow:hidden;
+  background:var(--panel2);
+  border:1px solid var(--line);
+}
+.previewframe img,.previewframe video{
+  width:100%;
+  display:block;
+  max-height:220px;
+  object-fit:cover;
+}
+.previewlink{
+  display:block;
+  padding:12px;
+  color:inherit;
+  text-decoration:none;
+  font-size:13px;
+}
+.lowdata .media video{
+  display:none;
+}
+.lowdata .media img{
+  max-height:240px;
+}
+.lowdata .post,
+.lowdata .msgbox{
+  box-shadow:none;
+}
+.lowdata .pill2,
+.lowdata .badge{
+  opacity:.95;
 }
 .mobilebar{
   display:none;
@@ -1246,7 +1298,6 @@ button,input,textarea,select{font:inherit}
     max-height:140px;
   }
 
-  .messages,
   #feedList,
   #messages{
     padding-bottom:88px;
@@ -1354,8 +1405,16 @@ button,input,textarea,select{font:inherit}
         <div class="box">
           <div class="label">Create a post</div>
           <textarea id="postText" class="textarea" placeholder="What's happening?"></textarea>
+
+          <div class="settingrow">
+            <button class="secondary" id="pickPostMediaBtn">Attach photo/video</button>
+            <button class="secondary" id="clearPostMediaBtn">Clear attachment</button>
+          </div>
+
+          <div id="postMediaPreview" class="previewframe" style="display:none"></div>
+
           <div class="row" style="margin-top:10px">
-            <input id="mediaUrl" class="input" placeholder="Media URL (image / video / clip)">
+            <input id="mediaUrl" class="input" placeholder="Optional media URL">
             <select id="mediaType" class="select">
               <option value="text">Text</option>
               <option value="image">Image</option>
@@ -1396,7 +1455,20 @@ button,input,textarea,select{font:inherit}
       <div class="section" id="profileSection">
         <div class="label">Your profile</div>
         <div class="box">
-          <input id="nameInput" class="input" placeholder="Username">
+          <div class="row" style="align-items:center; gap:12px">
+            <div id="avatarPreview" class="avatar" style="width:56px;height:56px;border-radius:18px;font-size:18px">U</div>
+            <div style="min-width:0">
+              <b id="profilePreviewName">You</b><br>
+              <span id="profilePreviewBio" style="color:var(--muted);font-size:12px">Set your profile below</span>
+            </div>
+          </div>
+
+          <div class="settingrow">
+            <button class="secondary" id="pickAvatarBtn">Upload avatar</button>
+            <button class="secondary" id="clearAvatarBtn">Clear avatar</button>
+          </div>
+
+          <input id="nameInput" class="input" placeholder="Username" style="margin-top:10px">
           <input id="avatarInput" class="input" placeholder="Avatar URL" style="margin-top:8px">
           <textarea id="bioInput" class="textarea" placeholder="Bio" style="min-height:70px;margin-top:8px"></textarea>
 
@@ -1408,7 +1480,14 @@ button,input,textarea,select{font:inherit}
             <input id="accentInput" class="input" type="color" style="max-width:90px;padding:6px 8px;">
           </div>
 
-          <button class="primary" id="profileBtn" style="margin-top:10px;width:100%">Save profile</button>
+          <label class="toggle" style="margin-top:10px;">
+            <input id="lowDataInput" type="checkbox">
+            Low data mode
+          </label>
+
+          <div class="settingrow">
+            <button class="primary" id="profileBtn" style="margin-top:0;width:100%">Save profile</button>
+          </div>
         </div>
       </div>
 
@@ -1428,7 +1507,7 @@ button,input,textarea,select{font:inherit}
       </div>
 
       <div class="smallnote">
-        Username, avatar, bio, accent, and theme can all be changed anytime.
+        Username, avatar, bio, accent, theme, and low-data mode can all be changed anytime.
       </div>
     </div>
   </aside>
@@ -1441,6 +1520,9 @@ button,input,textarea,select{font:inherit}
   <button class="mobbtn" id="mobPeopleBtn">People</button>
   <button class="mobbtn settings-btn" id="mobSettingsBtn">⚙</button>
 </div>
+
+<input id="avatarFileInput" type="file" accept="image/*" hidden>
+<input id="postFileInput" type="file" accept="image/*,video/*" hidden>
 
 <script>
 (() => {
@@ -1463,12 +1545,27 @@ button,input,textarea,select{font:inherit}
     bio: localStorage.getItem("linkup_bio") || "",
     accent: localStorage.getItem("linkup_accent") || "#5865f2",
     theme: localStorage.getItem("linkup_theme") || "dark",
+    manualLowData: localStorage.getItem("linkup_lowdata") === "1",
     socket: null,
     seq: 0,
     typingTimer: null,
     reconnectTimer: null,
     replyTo: null,
     connectedOnce: false,
+    lowData: false,
+    network: {
+      connection: null,
+      effectiveType: "unknown",
+      saveData: false,
+      downlink: null,
+      rtt: null,
+      type: "unknown",
+    },
+    draftPost: {
+      dataUrl: "",
+      type: "text",
+      name: "",
+    },
     data: {
       feed: [],
       messages: [],
@@ -1494,6 +1591,7 @@ button,input,textarea,select{font:inherit}
   function applyTheme() {
     document.documentElement.setAttribute("data-theme", state.theme === "light" ? "light" : "dark");
     document.documentElement.style.setProperty("--accent", state.accent || "#5865f2");
+    document.body.classList.toggle("lowdata", shouldUseLowData());
   }
 
   function esc(s) {
@@ -1527,6 +1625,110 @@ button,input,textarea,select{font:inherit}
 
   function flattenSearch(item) {
     return JSON.stringify(item).toLowerCase();
+  }
+
+  function detectNetworkMode() {
+    const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection || null;
+    state.network.connection = conn;
+
+    if (!conn) {
+      state.network.effectiveType = "unknown";
+      state.network.saveData = false;
+      state.network.downlink = null;
+      state.network.rtt = null;
+      state.network.type = "unknown";
+      return;
+    }
+
+    state.network.effectiveType = conn.effectiveType || "unknown";
+    state.network.saveData = Boolean(conn.saveData);
+    state.network.downlink = typeof conn.downlink === "number" ? conn.downlink : null;
+    state.network.rtt = typeof conn.rtt === "number" ? conn.rtt : null;
+    state.network.type = conn.type || "unknown";
+  }
+
+  function shouldUseLowData() {
+    const conn = state.network;
+    const slow = new Set(["slow-2g", "2g", "3g"]);
+    return state.manualLowData || conn.saveData || slow.has(conn.effectiveType) || conn.type === "cellular";
+  }
+
+  function lowDataBadgeText() {
+    const pieces = [];
+    if (state.network.effectiveType && state.network.effectiveType !== "unknown") pieces.push(state.network.effectiveType);
+    if (state.network.saveData) pieces.push("save-data");
+    if (state.manualLowData) pieces.push("manual");
+    if (!pieces.length) pieces.push("normal");
+    return `Data: ${pieces.join(" • ")}`;
+  }
+
+  function applyNetworkMode() {
+    detectNetworkMode();
+    const badgeId = "networkBadge";
+    let badge = document.getElementById(badgeId);
+
+    if (!badge) {
+      badge = document.createElement("div");
+      badge.id = badgeId;
+      badge.style.position = "fixed";
+      badge.style.right = "12px";
+      badge.style.bottom = "76px";
+      badge.style.zIndex = "60";
+      badge.style.padding = "8px 10px";
+      badge.style.borderRadius = "999px";
+      badge.style.fontSize = "12px";
+      badge.style.background = "rgba(0,0,0,.55)";
+      badge.style.color = "#fff";
+      badge.style.backdropFilter = "blur(8px)";
+      document.body.appendChild(badge);
+    }
+
+    badge.textContent = lowDataBadgeText();
+    badge.style.display = "block";
+    document.body.classList.toggle("lowdata", shouldUseLowData());
+  }
+
+  function bindNetworkSignals() {
+    applyNetworkMode();
+
+    const conn = state.network.connection;
+    if (conn && typeof conn.addEventListener === "function") {
+      conn.addEventListener("change", () => {
+        const before = shouldUseLowData();
+        applyNetworkMode();
+        if (before !== shouldUseLowData()) {
+          renderFeed();
+          renderMessages();
+          renderTrending();
+        }
+      });
+    }
+
+    window.addEventListener("online", () => {
+      applyNetworkMode();
+      if (state.socket && state.socket.readyState !== WebSocket.OPEN) connect();
+    });
+
+    window.addEventListener("offline", () => {
+      setConn("offline");
+      applyNetworkMode();
+    });
+  }
+
+  function fileToDataURL(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result || ""));
+      reader.onerror = () => reject(new Error("Failed to read file"));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function fileKind(file) {
+    if (!file) return "text";
+    if (file.type.startsWith("image/")) return "image";
+    if (file.type.startsWith("video/")) return "video";
+    return "text";
   }
 
   function renderServers() {
@@ -1580,6 +1782,31 @@ button,input,textarea,select{font:inherit}
     return !q ? state.data.messages : state.data.messages.filter((m) => flattenSearch(m).includes(q));
   }
 
+  function mediaBlock(url, type, name) {
+    if (!url) return "";
+
+    if (shouldUseLowData()) {
+      return `
+        <div class="media compact">
+          <a class="previewlink" href="${esc(url)}" target="_blank" rel="noreferrer noopener">
+            ${name ? esc(name) : "Open media"}
+          </a>
+        </div>
+      `;
+    }
+
+    if (type === "video" || /\.(mp4|webm|mov|m4v)(\?.*)?$/i.test(url)) {
+      return `<div class="media"><video controls preload="metadata" src="${esc(url)}"></video></div>`;
+    }
+
+    return `<div class="media"><img loading="lazy" decoding="async" src="${esc(url)}" alt=""></div>`;
+  }
+
+  function avatarNode(name, avatar) {
+    if (avatar) return `<img class="avatarimg" src="${esc(avatar)}" alt="">`;
+    return `<div class="avatar">${esc((name || "?").slice(0,1).toUpperCase())}</div>`;
+  }
+
   function renderFeed() {
     feedList.innerHTML = feedFiltered().map((p) => {
       const comments = (p.comments || []).slice(-3).map((c) => `
@@ -1589,20 +1816,13 @@ button,input,textarea,select{font:inherit}
         </div>
       `).join("");
 
-      const media =
-        p.media_url
-          ? (
-              p.media_type === "video" || /\.(mp4|webm|mov|m4v)(\?.*)?$/i.test(p.media_url)
-                ? `<div class="media"><video controls src="${esc(p.media_url)}"></video></div>`
-                : `<div class="media"><img src="${esc(p.media_url)}" alt=""></div>`
-            )
-          : "";
+      const media = mediaBlock(p.media_url, p.media_type, p.media_name);
 
       return `
         <div class="post" data-post="${esc(p.id)}">
           <div class="posthead">
             <div class="person">
-              ${p.avatar ? `<img class="avatarimg" src="${esc(p.avatar)}" alt="">` : `<div class="avatar">${esc((p.name || "?").slice(0,1).toUpperCase())}</div>`}
+              ${avatarNode(p.name, p.avatar)}
               <div>
                 <b>${esc(p.name || "Guest")}</b>
                 <span>${ts(p.created_at)} · ${esc(p.bio || "")}</span>
@@ -1630,7 +1850,7 @@ button,input,textarea,select{font:inherit}
         <div class="msgbox" data-id="${esc(m.msg_id)}">
           <div class="msghead">
             <div class="person">
-              ${m.avatar ? `<img class="avatarimg" src="${esc(m.avatar)}" alt="">` : `<div class="avatar">${esc((m.name || "?").slice(0,1).toUpperCase())}</div>`}
+              ${avatarNode(m.name, m.avatar)}
               <div>
                 <b>${esc(m.name || "Guest")}</b>
                 <span>${ts(m.created_at)}</span>
@@ -1678,6 +1898,11 @@ button,input,textarea,select{font:inherit}
   }
 
   function renderTrending() {
+    if (shouldUseLowData()) {
+      trendingList.innerHTML = `<div class="smallnote">Low data mode is on. Trending is simplified.</div>`;
+      return;
+    }
+
     trendingList.innerHTML = (state.data.trending || []).map((p) => `
       <div class="user">
         <div class="left">
@@ -1695,6 +1920,30 @@ button,input,textarea,select{font:inherit}
     el("bioInput").value = state.bio;
     el("themeInput").value = state.theme;
     el("accentInput").value = state.accent;
+    el("lowDataInput").checked = state.manualLowData;
+    el("profilePreviewName").textContent = state.name || "You";
+    el("profilePreviewBio").textContent = state.bio || "Set your profile below";
+
+    const preview = el("avatarPreview");
+    preview.innerHTML = state.avatar
+      ? `<img src="${esc(state.avatar)}" alt="" style="width:100%;height:100%;object-fit:cover;border-radius:inherit">`
+      : `${esc((state.name || "You").slice(0,1).toUpperCase())}`;
+  }
+
+  function renderDraftPreview() {
+    const preview = el("postMediaPreview");
+    if (!state.draftPost.dataUrl) {
+      preview.style.display = "none";
+      preview.innerHTML = "";
+      return;
+    }
+
+    preview.style.display = "block";
+    if (state.draftPost.type === "video") {
+      preview.innerHTML = `<video controls src="${state.draftPost.dataUrl}"></video>`;
+    } else {
+      preview.innerHTML = `<img src="${state.draftPost.dataUrl}" alt="">`;
+    }
   }
 
   function renderTop() {
@@ -1713,8 +1962,8 @@ button,input,textarea,select{font:inherit}
     el("feedPane").classList.toggle("active", state.tab === "feed");
     el("chatPane").classList.toggle("active", state.tab === "chat");
 
-    document.getElementById("mobFeedBtn").classList.toggle("active", state.tab === "feed");
-    document.getElementById("mobChatBtn").classList.toggle("active", state.tab === "chat");
+    el("mobFeedBtn").classList.toggle("active", state.tab === "feed");
+    el("mobChatBtn").classList.toggle("active", state.tab === "chat");
   }
 
   function renderAll() {
@@ -1724,6 +1973,7 @@ button,input,textarea,select{font:inherit}
     renderTop();
     renderTabs();
     renderSettingsFields();
+    renderDraftPreview();
     renderFeed();
     renderMessages();
     renderMembers();
@@ -1751,6 +2001,14 @@ button,input,textarea,select{font:inherit}
       rightbar.classList.add("open");
       sidebar.classList.remove("open");
       overlay.classList.add("open");
+    } else if (which === "people") {
+      rightbar.classList.add("open");
+      sidebar.classList.remove("open");
+      overlay.classList.add("open");
+      setTimeout(() => {
+        const sec = document.getElementById("peopleSection");
+        if (sec) sec.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 40);
     } else {
       closeDrawers();
     }
@@ -1762,12 +2020,31 @@ button,input,textarea,select{font:inherit}
     overlay.classList.remove("open");
   }
 
-  function focusRightSection(sectionId) {
-    openDrawer("settings");
-    setTimeout(() => {
-      const node = document.getElementById(sectionId);
-      if (node) node.scrollIntoView({ behavior: "smooth", block: "start" });
-    }, 50);
+  function bindMobile() {
+    el("mobFeedBtn").onclick = () => {
+      state.tab = "feed";
+      renderTabs();
+      closeDrawers();
+    };
+
+    el("mobChatBtn").onclick = () => {
+      state.tab = "chat";
+      renderTabs();
+      closeDrawers();
+    };
+
+    el("mobChannelsBtn").onclick = () => openDrawer("channels");
+    el("mobSettingsBtn").onclick = () => openDrawer("settings");
+    el("mobPeopleBtn").onclick = () => openDrawer("people");
+    el("openChannelsBtn").onclick = () => openDrawer("channels");
+    el("openSettingsBtn").onclick = () => openDrawer("settings");
+    el("closeSidebarBtn").onclick = closeDrawers;
+    el("closeRightBtn").onclick = closeDrawers;
+    overlay.onclick = closeDrawers;
+
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closeDrawers();
+    });
   }
 
   function connect() {
@@ -1990,22 +2267,80 @@ button,input,textarea,select{font:inherit}
     state.bio = (el("bioInput").value || "").trim().slice(0, 80);
     state.theme = el("themeInput").value === "light" ? "light" : "dark";
     state.accent = el("accentInput").value || "#5865f2";
+    state.manualLowData = el("lowDataInput").checked;
 
     localStorage.setItem("linkup_name", state.name);
     localStorage.setItem("linkup_avatar", state.avatar);
     localStorage.setItem("linkup_bio", state.bio);
     localStorage.setItem("linkup_theme", state.theme);
     localStorage.setItem("linkup_accent", state.accent);
+    localStorage.setItem("linkup_lowdata", state.manualLowData ? "1" : "0");
 
     applyTheme();
     send("profile", { name: state.name, avatar: state.avatar, bio: state.bio, accent: state.accent });
     renderSettingsFields();
+    renderFeed();
+    renderTrending();
+  };
+
+  el("pickAvatarBtn").onclick = () => el("avatarFileInput").click();
+  el("clearAvatarBtn").onclick = () => {
+    state.avatar = "";
+    localStorage.removeItem("linkup_avatar");
+    renderSettingsFields();
+    send("profile", { name: state.name, avatar: "", bio: state.bio, accent: state.accent });
+  };
+
+  el("pickPostMediaBtn").onclick = () => el("postFileInput").click();
+  el("clearPostMediaBtn").onclick = () => {
+    state.draftPost = { dataUrl: "", type: "text", name: "" };
+    renderDraftPreview();
+  };
+
+  el("avatarFileInput").onchange = async () => {
+    const file = el("avatarFileInput").files && el("avatarFileInput").files[0];
+    if (!file) return;
+
+    if (!file.type.startsWith("image/")) {
+      alert("Pick an image file for your avatar.");
+      el("avatarFileInput").value = "";
+      return;
+    }
+
+    const dataUrl = await fileToDataURL(file);
+    state.avatar = dataUrl;
+    localStorage.setItem("linkup_avatar", dataUrl);
+    renderSettingsFields();
+    send("profile", { name: state.name, avatar: state.avatar, bio: state.bio, accent: state.accent });
+    el("avatarFileInput").value = "";
+  };
+
+  el("postFileInput").onchange = async () => {
+    const file = el("postFileInput").files && el("postFileInput").files[0];
+    if (!file) return;
+
+    const kind = fileKind(file);
+    if (kind === "text") {
+      alert("Pick an image or video file.");
+      el("postFileInput").value = "";
+      return;
+    }
+
+    const dataUrl = await fileToDataURL(file);
+    state.draftPost = {
+      dataUrl,
+      type: kind,
+      name: file.name || "",
+    };
+    renderDraftPreview();
+    el("postFileInput").value = "";
   };
 
   el("postBtn").onclick = () => {
     const text = el("postText").value.trim();
-    const media_url = el("mediaUrl").value.trim();
-    const media_type = el("mediaType").value;
+    const media_url = state.draftPost.dataUrl || el("mediaUrl").value.trim();
+    const media_type = state.draftPost.type || el("mediaType").value;
+    const media_name = state.draftPost.name || "";
 
     if (!text && !media_url) return;
 
@@ -2018,6 +2353,7 @@ button,input,textarea,select{font:inherit}
       text,
       media_url,
       media_type,
+      media_name,
       created_at: Date.now(),
       likes: 0,
       reposts: 0,
@@ -2025,10 +2361,12 @@ button,input,textarea,select{font:inherit}
     };
 
     optimisticAddPost(post);
-    send("post", { id: post.id, text, media_url, media_type, created_at: post.created_at });
+    send("post", { id: post.id, text, media_url, media_type, media_name, created_at: post.created_at });
 
     el("postText").value = "";
     el("mediaUrl").value = "";
+    state.draftPost = { dataUrl: "", type: "text", name: "" };
+    renderDraftPreview();
   };
 
   el("sendBtn").onclick = () => {
@@ -2087,11 +2425,21 @@ button,input,textarea,select{font:inherit}
     send("typing", {});
   });
 
-  document.getElementById("mobFeedBtn").onclick = () => state.tab = "feed";
-  document.getElementById("mobChatBtn").onclick = () => state.tab = "chat";
+  document.getElementById("mobFeedBtn").onclick = () => {
+    state.tab = "feed";
+    renderTabs();
+    closeDrawers();
+  };
+
+  document.getElementById("mobChatBtn").onclick = () => {
+    state.tab = "chat";
+    renderTabs();
+    closeDrawers();
+  };
+
   document.getElementById("mobChannelsBtn").onclick = () => openDrawer("channels");
   document.getElementById("mobSettingsBtn").onclick = () => openDrawer("settings");
-  document.getElementById("mobPeopleBtn").onclick = () => focusRightSection("peopleSection");
+  document.getElementById("mobPeopleBtn").onclick = () => openDrawer("people");
   document.getElementById("openChannelsBtn").onclick = () => openDrawer("channels");
   document.getElementById("openSettingsBtn").onclick = () => openDrawer("settings");
   document.getElementById("closeSidebarBtn").onclick = closeDrawers;
@@ -2110,6 +2458,7 @@ button,input,textarea,select{font:inherit}
     } catch {}
   });
 
+  bindNetworkSignals();
   renderAll();
   connect();
 })();
