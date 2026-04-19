@@ -2,12 +2,8 @@ from __future__ import annotations
 
 import json
 import os
-import sqlite3
 import time
 from collections import defaultdict
-from contextlib import contextmanager
-from pathlib import Path
-from threading import RLock
 from typing import Dict, List, Optional
 from uuid import uuid4
 
@@ -26,9 +22,6 @@ class Settings:
         origins = os.getenv("CORS_ORIGINS", "*").strip()
         self.cors_origins = ["*"] if origins == "*" else [o.strip() for o in origins.split(",") if o.strip()]
 
-        self.db_path = Path(os.getenv("LINKUP_DB_PATH", "/var/data/linkup.db"))
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-
 
 settings = Settings()
 
@@ -41,7 +34,6 @@ app.add_middleware(
 )
 
 ws_router = APIRouter()
-DB_LOCK = RLock()
 
 ROOMS_META = [
     {"id": "general", "name": "general", "desc": "Town square for everything."},
@@ -64,12 +56,6 @@ def uid(prefix: str) -> str:
 def clamp_text(value: str, length: int) -> str:
     value = (value or "").strip()
     return value[:length] if value else ""
-
-
-def row_to_dict(row: sqlite3.Row | None) -> Optional[dict]:
-    if row is None:
-        return None
-    return dict(row)
 
 
 def serialize_profile(profile: dict) -> dict:
@@ -106,8 +92,8 @@ def serialize_post(post: dict) -> dict:
         "media_type": post.get("media_type", "text"),
         "media_name": post.get("media_name", ""),
         "created_at": post.get("created_at", now_ms()),
-        "likes": post.get("likes", 0),
-        "reposts": post.get("reposts", 0),
+        "likes": len(post.get("likes", set())),
+        "reposts": len(post.get("reposts", set())),
         "comments": [serialize_comment(c) for c in post.get("comments", [])][-24:],
     }
 
@@ -130,504 +116,88 @@ def serialize_message(msg: dict) -> dict:
 
 
 # ----------------------------
-# SQLite
+# In-memory live state
 # ----------------------------
 
-def connect_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(settings.db_path, timeout=30, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.execute("PRAGMA journal_mode = WAL;")
-    conn.execute("PRAGMA synchronous = NORMAL;")
-    return conn
+ROOM_POSTS: Dict[str, List[dict]] = defaultdict(list)
+ROOM_MESSAGES: Dict[str, List[dict]] = defaultdict(list)
+ROOM_USERS: Dict[str, Dict[str, dict]] = defaultdict(dict)
+
+PROFILES: Dict[str, dict] = {}
 
 
-@contextmanager
-def db(write: bool = False):
-    conn = connect_db()
-    try:
-        yield conn
-        if write:
-            conn.commit()
-    except Exception:
-        if write:
-            conn.rollback()
-        raise
-    finally:
-        conn.close()
+def get_profile(client_id: str) -> dict:
+    if client_id not in PROFILES:
+        PROFILES[client_id] = {
+            "client_id": client_id,
+            "name": "Guest",
+            "avatar": "",
+            "bio": "",
+            "accent": "#5865f2",
+            "joined_at": now_ms(),
+        }
+    return PROFILES[client_id]
 
 
-def init_db() -> None:
-    with DB_LOCK, db(write=True) as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS profiles (
-                client_id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                avatar TEXT NOT NULL DEFAULT '',
-                bio TEXT NOT NULL DEFAULT '',
-                accent TEXT NOT NULL DEFAULT '#5865f2',
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS messages (
-                msg_id TEXT PRIMARY KEY,
-                room_id TEXT NOT NULL,
-                client_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                avatar TEXT NOT NULL DEFAULT '',
-                text TEXT NOT NULL,
-                reply_to TEXT,
-                reply_name TEXT,
-                reply_text TEXT,
-                created_at INTEGER NOT NULL,
-                is_system INTEGER NOT NULL DEFAULT 0,
-                pinned INTEGER NOT NULL DEFAULT 0
-            );
-
-            CREATE TABLE IF NOT EXISTS message_reactions (
-                msg_id TEXT NOT NULL,
-                emoji TEXT NOT NULL,
-                client_id TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                PRIMARY KEY (msg_id, emoji, client_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS posts (
-                post_id TEXT PRIMARY KEY,
-                client_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                avatar TEXT NOT NULL DEFAULT '',
-                bio TEXT NOT NULL DEFAULT '',
-                text TEXT NOT NULL,
-                media_url TEXT NOT NULL DEFAULT '',
-                media_type TEXT NOT NULL DEFAULT 'text',
-                media_name TEXT NOT NULL DEFAULT '',
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS post_likes (
-                post_id TEXT NOT NULL,
-                client_id TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                PRIMARY KEY (post_id, client_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS post_reposts (
-                post_id TEXT NOT NULL,
-                client_id TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                PRIMARY KEY (post_id, client_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS post_comments (
-                id TEXT PRIMARY KEY,
-                post_id TEXT NOT NULL,
-                client_id TEXT NOT NULL,
-                name TEXT NOT NULL,
-                avatar TEXT NOT NULL DEFAULT '',
-                text TEXT NOT NULL,
-                created_at INTEGER NOT NULL
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_messages_room_time ON messages(room_id, created_at);
-            CREATE INDEX IF NOT EXISTS idx_posts_time ON posts(created_at);
-            CREATE INDEX IF NOT EXISTS idx_comments_post_time ON post_comments(post_id, created_at);
-            """
-        )
+def room_users(room: str) -> List[dict]:
+    users = list(ROOM_USERS[room].values())
+    users.sort(key=lambda u: (u.get("name", "").lower(), u.get("joined_at", 0)))
+    return users
 
 
-init_db()
+def room_messages(room: str) -> List[dict]:
+    return ROOM_MESSAGES[room][-250:]
 
 
-# ----------------------------
-# Database helpers
-# ----------------------------
-
-def db_get_profile(client_id: str) -> Optional[dict]:
-    with db() as conn:
-        row = conn.execute(
-            "SELECT client_id, name, avatar, bio, accent, created_at, updated_at FROM profiles WHERE client_id = ?",
-            (client_id,),
-        ).fetchone()
-        return row_to_dict(row)
+def room_posts(room: str) -> List[dict]:
+    return ROOM_POSTS[room][-120:]
 
 
-def db_upsert_profile(client_id: str, name: str, avatar: str, bio: str, accent: str) -> dict:
-    existing = db_get_profile(client_id)
-    created_at = existing["created_at"] if existing else now_ms()
-    name = clamp_text(name or (existing["name"] if existing else "Guest"), 24) or "Guest"
-    avatar = (avatar if avatar is not None else (existing["avatar"] if existing else "")).strip()
-    bio = clamp_text(bio if bio is not None else (existing["bio"] if existing else ""), 80)
-    accent = clamp_text(accent if accent is not None else (existing["accent"] if existing else "#5865f2"), 20) or "#5865f2"
-    updated_at = now_ms()
+def room_pins(room: str) -> List[dict]:
+    return [m for m in ROOM_MESSAGES[room] if m.get("pinned")]
 
-    with DB_LOCK, db(write=True) as conn:
-        conn.execute(
-            """
-            INSERT INTO profiles (client_id, name, avatar, bio, accent, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(client_id) DO UPDATE SET
-                name=excluded.name,
-                avatar=excluded.avatar,
-                bio=excluded.bio,
-                accent=excluded.accent,
-                updated_at=excluded.updated_at
-            """,
-            (client_id, name, avatar, bio, accent, created_at, updated_at),
-        )
 
+def find_message(room: str, msg_id: str) -> Optional[dict]:
+    for msg in ROOM_MESSAGES[room]:
+        if msg["msg_id"] == msg_id:
+            return msg
+    return None
+
+
+def find_post(post_id: str) -> Optional[dict]:
+    for room in ROOM_POSTS:
+        for post in ROOM_POSTS[room]:
+            if post["id"] == post_id:
+                return post
+    return None
+
+
+def message_reaction_counts(room: str, msg_id: str) -> dict:
+    msg = find_message(room, msg_id)
+    return dict(msg.get("reactions", {})) if msg else {}
+
+
+def snapshot_room(room: str) -> dict:
     return {
-        "client_id": client_id,
-        "name": name,
-        "avatar": avatar,
-        "bio": bio,
-        "accent": accent,
-        "created_at": created_at,
-        "updated_at": updated_at,
+        "kind": "init",
+        "room": room,
+        "users": room_users(room),
+        "history": [serialize_message(m) for m in room_messages(room)],
+        "pins": [serialize_message(m) for m in room_pins(room)],
+        "feed": [serialize_post(p) for p in room_posts(room)],
+        "feed_trending": [serialize_post(p) for p in room_posts(room)[:8]],
+        "rooms": ROOMS_META,
+        "suggestions": SEARCH_HINTS,
+        "time": now_ms(),
     }
 
 
-def db_profile_from_client(client_id: str, fallback_name: str = "Guest") -> dict:
-    profile = db_get_profile(client_id)
-    if profile:
-        return profile
-    return db_upsert_profile(client_id, fallback_name, "", "", "#5865f2")
-
-
-def db_message_reactions(msg_id: str) -> dict:
-    with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT emoji, COUNT(*) AS c
-            FROM message_reactions
-            WHERE msg_id = ?
-            GROUP BY emoji
-            """,
-            (msg_id,),
-        ).fetchall()
-    return {row["emoji"]: row["c"] for row in rows}
-
-
-def db_load_room_messages(room_id: str, limit: int = 200) -> List[dict]:
-    with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT msg_id, room_id, client_id, name, avatar, text, reply_to, reply_name, reply_text,
-                   created_at, is_system, pinned
-            FROM messages
-            WHERE room_id = ?
-            ORDER BY created_at ASC
-            LIMIT ?
-            """,
-            (room_id, limit),
-        ).fetchall()
-
-    messages: List[dict] = []
-    for row in rows:
-        msg = dict(row)
-        msg["reactions"] = db_message_reactions(msg["msg_id"])
-        messages.append(msg)
-    return messages
-
-
-def db_save_message(
-    room_id: str,
-    client_id: str,
-    name: str,
-    avatar: str,
-    text: str,
-    msg_id: Optional[str] = None,
-    created_at: Optional[int] = None,
-    reply_to: Optional[str] = None,
-    reply_name: Optional[str] = None,
-    reply_text: Optional[str] = None,
-    is_system: int = 0,
-) -> dict:
-    msg_id = msg_id or uid("msg")
-    created_at = created_at or now_ms()
-
-    with DB_LOCK, db(write=True) as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO messages (
-                msg_id, room_id, client_id, name, avatar, text,
-                reply_to, reply_name, reply_text, created_at, is_system, pinned
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-            """,
-            (
-                msg_id,
-                room_id,
-                client_id,
-                name,
-                avatar,
-                text,
-                reply_to,
-                reply_name,
-                reply_text,
-                created_at,
-                is_system,
-            ),
-        )
-
-    row = db_get_message(msg_id)
-    return row or {
-        "msg_id": msg_id,
-        "room_id": room_id,
-        "client_id": client_id,
-        "name": name,
-        "avatar": avatar,
-        "text": text,
-        "reply_to": reply_to,
-        "reply_name": reply_name,
-        "reply_text": reply_text,
-        "created_at": created_at,
-        "is_system": is_system,
-        "pinned": 0,
-        "reactions": {},
-    }
-
-
-def db_get_message(msg_id: str) -> Optional[dict]:
-    with db() as conn:
-        row = conn.execute(
-            """
-            SELECT msg_id, room_id, client_id, name, avatar, text, reply_to, reply_name, reply_text,
-                   created_at, is_system, pinned
-            FROM messages
-            WHERE msg_id = ?
-            """,
-            (msg_id,),
-        ).fetchone()
-    if not row:
-        return None
-    msg = dict(row)
-    msg["reactions"] = db_message_reactions(msg_id)
-    return msg
-
-
-def db_get_message_preview(msg_id: str) -> Optional[dict]:
-    with db() as conn:
-        row = conn.execute(
-            "SELECT msg_id, name, text FROM messages WHERE msg_id = ?",
-            (msg_id,),
-        ).fetchone()
-    if not row:
-        return None
-    return {"msg_id": row["msg_id"], "name": row["name"], "text": row["text"]}
-
-
-def db_toggle_message_pin(msg_id: str) -> Optional[dict]:
-    with DB_LOCK, db(write=True) as conn:
-        row = conn.execute("SELECT pinned FROM messages WHERE msg_id = ?", (msg_id,)).fetchone()
-        if not row:
-            return None
-        new_value = 0 if int(row["pinned"]) else 1
-        conn.execute("UPDATE messages SET pinned = ? WHERE msg_id = ?", (new_value, msg_id))
-    msg = db_get_message(msg_id)
-    if not msg:
-        return None
-    action = "unpinned" if msg["pinned"] else "pinned"
-    return {"action": action, "message": serialize_message(msg)}
-
-
-def db_toggle_message_reaction(msg_id: str, emoji: str, client_id: str) -> Optional[dict]:
-    emoji = (emoji or "👍").strip()[:4] or "👍"
-    with DB_LOCK, db(write=True) as conn:
-        existing = conn.execute(
-            "SELECT 1 FROM message_reactions WHERE msg_id = ? AND emoji = ? AND client_id = ?",
-            (msg_id, emoji, client_id),
-        ).fetchone()
-        if existing:
-            conn.execute(
-                "DELETE FROM message_reactions WHERE msg_id = ? AND emoji = ? AND client_id = ?",
-                (msg_id, emoji, client_id),
-            )
-        else:
-            conn.execute(
-                "INSERT OR IGNORE INTO message_reactions (msg_id, emoji, client_id, created_at) VALUES (?, ?, ?, ?)",
-                (msg_id, emoji, client_id, now_ms()),
-            )
-
-    msg = db_get_message(msg_id)
-    if not msg:
-        return None
-    return {"msg_id": msg_id, "reactions": msg["reactions"]}
-
-
-def db_feed_counts(post_id: str) -> tuple[int, int]:
-    with db() as conn:
-        likes = conn.execute("SELECT COUNT(*) AS c FROM post_likes WHERE post_id = ?", (post_id,)).fetchone()["c"]
-        reposts = conn.execute("SELECT COUNT(*) AS c FROM post_reposts WHERE post_id = ?", (post_id,)).fetchone()["c"]
-    return likes, reposts
-
-
-def db_load_post_comments(post_id: str) -> List[dict]:
-    with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT id, post_id, client_id, name, avatar, text, created_at
-            FROM post_comments
-            WHERE post_id = ?
-            ORDER BY created_at ASC
-            """,
-            (post_id,),
-        ).fetchall()
-    return [dict(row) for row in rows]
-
-
-def db_get_post(post_id: str) -> Optional[dict]:
-    with db() as conn:
-        row = conn.execute(
-            """
-            SELECT post_id, client_id, name, avatar, bio, text, media_url, media_type, media_name, created_at
-            FROM posts
-            WHERE post_id = ?
-            """,
-            (post_id,),
-        ).fetchone()
-    if not row:
-        return None
-    post = dict(row)
-    post["id"] = post.pop("post_id")
-    likes, reposts = db_feed_counts(post["id"])
-    post["likes"] = likes
-    post["reposts"] = reposts
-    post["comments"] = db_load_post_comments(post["id"])
-    return post
-
-
-def db_load_feed(limit: int = 80) -> List[dict]:
-    with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT post_id, client_id, name, avatar, bio, text, media_url, media_type, media_name, created_at
-            FROM posts
-            ORDER BY created_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-
-    posts: List[dict] = []
-    for row in rows:
-        post = dict(row)
-        post["id"] = post.pop("post_id")
-        likes, reposts = db_feed_counts(post["id"])
-        post["likes"] = likes
-        post["reposts"] = reposts
-        post["comments"] = db_load_post_comments(post["id"])
-        posts.append(post)
-    return posts
-
-
-def db_save_post(
-    client_id: str,
-    name: str,
-    avatar: str,
-    bio: str,
-    text: str,
-    media_url: str = "",
-    media_type: str = "text",
-    media_name: str = "",
-    post_id: Optional[str] = None,
-    created_at: Optional[int] = None,
-) -> dict:
-    post_id = post_id or uid("post")
-    created_at = created_at or now_ms()
-
-    with DB_LOCK, db(write=True) as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO posts (
-                post_id, client_id, name, avatar, bio, text,
-                media_url, media_type, media_name, created_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                post_id,
-                client_id,
-                name,
-                avatar,
-                bio,
-                text,
-                media_url,
-                media_type,
-                media_name,
-                created_at,
-            ),
-        )
-    row = db_get_post(post_id)
-    return row or {
-        "id": post_id,
-        "client_id": client_id,
-        "name": name,
-        "avatar": avatar,
-        "bio": bio,
-        "text": text,
-        "media_url": media_url,
-        "media_type": media_type,
-        "media_name": media_name,
-        "created_at": created_at,
-        "likes": 0,
-        "reposts": 0,
-        "comments": [],
-    }
-
-
-def db_toggle_post_like(post_id: str, client_id: str) -> Optional[dict]:
-    with DB_LOCK, db(write=True) as conn:
-        existing = conn.execute(
-            "SELECT 1 FROM post_likes WHERE post_id = ? AND client_id = ?",
-            (post_id, client_id),
-        ).fetchone()
-        if existing:
-            conn.execute("DELETE FROM post_likes WHERE post_id = ? AND client_id = ?", (post_id, client_id))
-        else:
-            conn.execute(
-                "INSERT OR IGNORE INTO post_likes (post_id, client_id, created_at) VALUES (?, ?, ?)",
-                (post_id, client_id, now_ms()),
-            )
-    return db_get_post(post_id)
-
-
-def db_toggle_post_repost(post_id: str, client_id: str) -> Optional[dict]:
-    with DB_LOCK, db(write=True) as conn:
-        existing = conn.execute(
-            "SELECT 1 FROM post_reposts WHERE post_id = ? AND client_id = ?",
-            (post_id, client_id),
-        ).fetchone()
-        if existing:
-            conn.execute("DELETE FROM post_reposts WHERE post_id = ? AND client_id = ?", (post_id, client_id))
-        else:
-            conn.execute(
-                "INSERT OR IGNORE INTO post_reposts (post_id, client_id, created_at) VALUES (?, ?, ?)",
-                (post_id, client_id, now_ms()),
-            )
-    return db_get_post(post_id)
-
-
-def db_add_post_comment(
-    post_id: str,
-    client_id: str,
-    name: str,
-    avatar: str,
-    text: str,
-    comment_id: Optional[str] = None,
-) -> Optional[dict]:
-    comment_id = comment_id or uid("c")
-    with DB_LOCK, db(write=True) as conn:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO post_comments (id, post_id, client_id, name, avatar, text, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (comment_id, post_id, client_id, name, avatar, text, now_ms()),
-        )
-    return db_get_post(post_id)
+def current_feed_global() -> List[dict]:
+    all_posts = []
+    for room in ROOM_POSTS:
+        all_posts.extend(ROOM_POSTS[room])
+    all_posts.sort(key=lambda p: p.get("created_at", 0), reverse=True)
+    return [serialize_post(p) for p in all_posts[:120]]
 
 
 # ----------------------------
@@ -637,26 +207,20 @@ def db_add_post_comment(
 class Rooms:
     def __init__(self) -> None:
         self.sockets: Dict[str, Dict[str, WebSocket]] = defaultdict(dict)
-        self.members: Dict[str, Dict[str, dict]] = defaultdict(dict)
 
     def register(self, room: str, profile: dict, ws: WebSocket) -> None:
-        self.members[room][profile["client_id"]] = serialize_profile(profile)
+        ROOM_USERS[room][profile["client_id"]] = serialize_profile(profile)
         self.sockets[room][profile["client_id"]] = ws
 
     def unregister(self, room: str, client_id: str) -> None:
         self.sockets[room].pop(client_id, None)
-        self.members[room].pop(client_id, None)
+        ROOM_USERS[room].pop(client_id, None)
 
-    def update_client_profile(self, client_id: str, profile: dict) -> None:
+    def update_profile(self, client_id: str, profile: dict) -> None:
         snap = serialize_profile(profile)
-        for room in list(self.members.keys()):
-            if client_id in self.members[room]:
-                self.members[room][client_id] = snap
-
-    def current_users(self, room: str) -> List[dict]:
-        users = list(self.members[room].values())
-        users.sort(key=lambda u: (u.get("name", "").lower(), u.get("joined_at", 0)))
-        return users
+        for room in list(ROOM_USERS.keys()):
+            if client_id in ROOM_USERS[room]:
+                ROOM_USERS[room][client_id] = snap
 
     async def broadcast_room(self, room: str, payload: dict) -> None:
         dead = []
@@ -682,7 +246,7 @@ async def push_presence(room: str) -> None:
         {
             "kind": "presence",
             "room": room,
-            "users": ROOMS.current_users(room),
+            "users": room_users(room),
             "time": now_ms(),
         },
     )
@@ -698,22 +262,22 @@ async def push_profile(profile: dict) -> None:
     )
 
 
-async def push_init(room: str, ws: WebSocket, client_id: str) -> None:
-    await ws.send_json(
+async def push_feed_snapshot() -> None:
+    await ROOMS.broadcast_all(
         {
-            "kind": "init",
-            "client_id": client_id,
-            "room": room,
-            "users": ROOMS.current_users(room),
-            "history": [serialize_message(m) for m in db_load_room_messages(room, 200)],
-            "pins": [serialize_message(m) for m in db_load_room_messages(room, 200) if m.get("pinned")],
-            "feed": [serialize_post(p) for p in db_load_feed(80)],
-            "feed_trending": [serialize_post(p) for p in db_load_feed(80)[:8]],
-            "rooms": ROOMS_META,
-            "suggestions": SEARCH_HINTS,
+            "kind": "feed_snapshot",
+            "feed": current_feed_global(),
+            "feed_trending": current_feed_global()[:8],
             "time": now_ms(),
         }
     )
+
+
+async def push_feed_update(post_id: str) -> None:
+    post = find_post(post_id)
+    if not post:
+        return
+    await ROOMS.broadcast_all({"kind": "feed_update", "post": serialize_post(post), "time": now_ms()})
 
 
 async def push_chat_message(room: str, msg: dict) -> None:
@@ -726,28 +290,6 @@ async def push_pin_update(room: str, result: dict) -> None:
 
 async def push_reaction_update(room: str, result: dict) -> None:
     await ROOMS.broadcast_room(room, {"kind": "reaction_update", **result, "time": now_ms()})
-
-
-async def push_feed_post() -> None:
-    await ROOMS.broadcast_all(
-        {
-            "kind": "feed_snapshot",
-            "feed": [serialize_post(p) for p in db_load_feed(80)],
-            "feed_trending": [serialize_post(p) for p in db_load_feed(80)[:8]],
-            "time": now_ms(),
-        }
-    )
-
-
-async def push_feed_update(post_id: str) -> None:
-    post = db_get_post(post_id)
-    if not post:
-        return
-    await ROOMS.broadcast_all({"kind": "feed_update", "post": serialize_post(post), "time": now_ms()})
-
-
-async def push_pong(ws: WebSocket) -> None:
-    await ws.send_json({"kind": "pong", "time": now_ms()})
 
 
 async def push_typing(room: str, name: str, client_id: str) -> None:
@@ -777,8 +319,169 @@ async def push_system(room: str, text: str) -> None:
     )
 
 
+async def push_pong(ws: WebSocket) -> None:
+    await ws.send_json({"kind": "pong", "time": now_ms()})
+
+
 # ----------------------------
-# WebSocket / actions
+# Mutations
+# ----------------------------
+
+def upsert_profile(client_id: str, name: str, avatar: str, bio: str, accent: str) -> dict:
+    profile = get_profile(client_id)
+    profile["name"] = clamp_text(name or profile["name"], 24) or "Guest"
+    profile["avatar"] = (avatar or profile["avatar"] or "").strip()
+    profile["bio"] = clamp_text(bio or profile["bio"], 80)
+    profile["accent"] = clamp_text(accent or profile["accent"], 20) or "#5865f2"
+    return profile
+
+
+def save_chat_message(
+    room: str,
+    client_id: str,
+    name: str,
+    avatar: str,
+    text: str,
+    msg_id: Optional[str] = None,
+    created_at: Optional[int] = None,
+    reply_to: Optional[str] = None,
+) -> dict:
+    msg_id = msg_id or uid("msg")
+    created_at = created_at or now_ms()
+
+    reply_preview = None
+    if reply_to:
+        prev = find_message(room, reply_to)
+        if prev:
+            reply_preview = {
+                "msg_id": prev["msg_id"],
+                "name": prev.get("name", "Guest"),
+                "text": prev.get("text", "")[:120],
+            }
+
+    msg = {
+        "msg_id": msg_id,
+        "room": room,
+        "client_id": client_id,
+        "name": name,
+        "avatar": avatar,
+        "text": text,
+        "created_at": created_at,
+        "reply_to": reply_to,
+        "reply_preview": reply_preview,
+        "reactions": {},
+        "pinned": 0,
+        "is_system": 0,
+    }
+    ROOM_MESSAGES[room].append(msg)
+    return msg
+
+
+def toggle_message_pin(room: str, msg_id: str) -> Optional[dict]:
+    msg = find_message(room, msg_id)
+    if not msg:
+        return None
+    msg["pinned"] = 0 if msg.get("pinned") else 1
+    action = "unpinned" if not msg.get("pinned") else "pinned"
+    return {"action": action, "message": serialize_message(msg)}
+
+
+def toggle_message_reaction(room: str, msg_id: str, emoji: str, client_id: str) -> Optional[dict]:
+    msg = find_message(room, msg_id)
+    if not msg:
+        return None
+
+    emoji = (emoji or "👍").strip()[:4] or "👍"
+    reactions = msg.setdefault("reactions", {})
+    user_set = reactions.setdefault(emoji, set())
+
+    if client_id in user_set:
+        user_set.remove(client_id)
+        if not user_set:
+            reactions.pop(emoji, None)
+    else:
+        user_set.add(client_id)
+
+    msg["reactions"] = reactions
+    return {"msg_id": msg_id, "reactions": {k: len(v) for k, v in reactions.items()}}
+
+
+def save_post(
+    client_id: str,
+    name: str,
+    avatar: str,
+    bio: str,
+    text: str,
+    media_url: str = "",
+    media_type: str = "text",
+    media_name: str = "",
+    post_id: Optional[str] = None,
+    created_at: Optional[int] = None,
+    room: str = "global",
+) -> dict:
+    post_id = post_id or uid("post")
+    created_at = created_at or now_ms()
+    post = {
+        "id": post_id,
+        "client_id": client_id,
+        "name": name,
+        "avatar": avatar,
+        "bio": bio,
+        "text": text,
+        "media_url": media_url,
+        "media_type": media_type,
+        "media_name": media_name,
+        "created_at": created_at,
+        "likes": set(),
+        "reposts": set(),
+        "comments": [],
+    }
+    ROOM_POSTS[room].append(post)
+    return post
+
+
+def toggle_post_like(post_id: str, client_id: str) -> Optional[dict]:
+    post = find_post(post_id)
+    if not post:
+        return None
+    likes = post.setdefault("likes", set())
+    if client_id in likes:
+        likes.remove(client_id)
+    else:
+        likes.add(client_id)
+    return post
+
+
+def toggle_post_repost(post_id: str, client_id: str) -> Optional[dict]:
+    post = find_post(post_id)
+    if not post:
+        return None
+    reps = post.setdefault("reposts", set())
+    if client_id in reps:
+        reps.remove(client_id)
+    else:
+        reps.add(client_id)
+    return post
+
+
+def add_post_comment(post_id: str, client_id: str, name: str, avatar: str, text: str, comment_id: Optional[str] = None) -> Optional[dict]:
+    post = find_post(post_id)
+    if not post:
+        return None
+    comment = {
+        "id": comment_id or uid("c"),
+        "client_id": client_id,
+        "name": name,
+        "avatar": avatar,
+        "text": text,
+        "created_at": now_ms(),
+    }
+    post.setdefault("comments", []).append(comment)
+    return post
+
+
+# ----------------------------
+# WebSocket
 # ----------------------------
 
 @ws_router.websocket("/{room_id}")
@@ -786,9 +489,8 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
     await websocket.accept()
 
     client_id = "cli_" + uuid4().hex[:10]
-    profile = db_profile_from_client(client_id)
+    profile = get_profile(client_id)
     active_room = room_id
-    ping_task_alive = True
 
     try:
         while True:
@@ -809,7 +511,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
 
             if kind == "hello":
                 client_id = str(data.get("client_id") or client_id)
-                profile = db_upsert_profile(
+                profile = upsert_profile(
                     client_id,
                     str(data.get("name") or profile["name"]),
                     str(data.get("avatar") or profile.get("avatar") or ""),
@@ -819,20 +521,20 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 active_room = str(data.get("room") or room_id)
 
                 ROOMS.register(active_room, profile, websocket)
-                await push_init(active_room, websocket, client_id)
+                await websocket.send_json(snapshot_room(active_room))
                 await push_presence(active_room)
                 continue
 
             if kind == "profile":
                 old_name = profile["name"]
-                profile = db_upsert_profile(
+                profile = upsert_profile(
                     client_id,
                     str(data.get("name") or profile["name"]),
                     str(data.get("avatar") or profile.get("avatar") or ""),
                     str(data.get("bio") or profile.get("bio") or ""),
                     str(data.get("accent") or profile.get("accent") or "#5865f2"),
                 )
-                ROOMS.update_client_profile(client_id, profile)
+                ROOMS.update_profile(client_id, profile)
                 await push_profile(profile)
                 await push_presence(active_room)
                 if old_name != profile["name"]:
@@ -847,16 +549,9 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 text = clamp_text(str(data.get("text") or ""), 5000)
                 if not text:
                     continue
-
                 reply_to = data.get("reply_to")
-                reply_preview = None
-                if reply_to:
-                    prev = db_get_message_preview(str(reply_to))
-                    if prev:
-                        reply_preview = prev
-
-                msg = db_save_message(
-                    room_id=active_room,
+                msg = save_chat_message(
+                    room=active_room,
                     client_id=client_id,
                     name=profile["name"],
                     avatar=profile["avatar"],
@@ -864,23 +559,19 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     msg_id=str(data.get("msg_id") or uid("msg")),
                     created_at=int(data.get("created_at") or now_ms()),
                     reply_to=str(reply_to) if reply_to else None,
-                    reply_name=(reply_preview["name"] if reply_preview else None),
-                    reply_text=(reply_preview["text"] if reply_preview else None),
-                    is_system=0,
                 )
-                if reply_preview:
-                    msg["reply_preview"] = reply_preview
                 await push_chat_message(active_room, msg)
                 continue
 
             if kind == "pin_chat":
-                result = db_toggle_message_pin(str(data.get("msg_id") or ""))
+                result = toggle_message_pin(active_room, str(data.get("msg_id") or ""))
                 if result:
                     await push_pin_update(active_room, result)
                 continue
 
             if kind == "react_chat":
-                result = db_toggle_message_reaction(
+                result = toggle_message_reaction(
+                    active_room,
                     str(data.get("msg_id") or ""),
                     str(data.get("emoji") or "👍")[:4],
                     client_id,
@@ -898,7 +589,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 if not text and not media_url:
                     continue
 
-                post = db_save_post(
+                save_post(
                     client_id=client_id,
                     name=profile["name"],
                     avatar=profile["avatar"],
@@ -909,18 +600,19 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     media_name=media_name,
                     post_id=str(data.get("id") or uid("post")),
                     created_at=int(data.get("created_at") or now_ms()),
+                    room=active_room,
                 )
-                await push_feed_post()
+                await push_feed_snapshot()
                 continue
 
             if kind == "feed_like":
-                post = db_toggle_post_like(str(data.get("post_id") or ""), client_id)
+                post = toggle_post_like(str(data.get("post_id") or ""), client_id)
                 if post:
                     await push_feed_update(post["id"])
                 continue
 
             if kind == "feed_repost":
-                post = db_toggle_post_repost(str(data.get("post_id") or ""), client_id)
+                post = toggle_post_repost(str(data.get("post_id") or ""), client_id)
                 if post:
                     await push_feed_update(post["id"])
                 continue
@@ -930,7 +622,7 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                 comment_text = clamp_text(str(data.get("text") or ""), 1000)
                 if not pid or not comment_text:
                     continue
-                post = db_add_post_comment(
+                post = add_post_comment(
                     pid,
                     client_id,
                     profile["name"],
@@ -954,12 +646,12 @@ app.include_router(ws_router, prefix="/ws")
 
 
 # ----------------------------
-# HTTP routes
+# HTTP
 # ----------------------------
 
 @app.get("/health")
 def health():
-    return {"ok": True, "app": "LinkUp", "db": str(settings.db_path)}
+    return {"ok": True, "app": "LinkUp"}
 
 
 @app.get("/api")
@@ -978,7 +670,7 @@ def spa(path: str):
 
 
 # ----------------------------
-# HTML / CSS / JS
+# Frontend
 # ----------------------------
 
 def page_html() -> str:
@@ -1823,17 +1515,26 @@ button,input,textarea,select{font:inherit}
 
   const el = (id) => document.getElementById(id);
 
+  const LS = {
+    profile: "linkup_profile_v3",
+    rooms: "linkup_rooms_v3",
+    settings: "linkup_settings_v3",
+    clientId: "linkup_client_id",
+    lastServer: "linkup_server",
+    lastChannel: "linkup_channel",
+  };
+
   const state = {
     tab: "feed",
-    server: localStorage.getItem("linkup_server") || "main",
-    channel: localStorage.getItem("linkup_channel") || "general",
-    clientId: localStorage.getItem("linkup_client_id") || ("cli_" + Math.random().toString(36).slice(2, 10)),
-    name: localStorage.getItem("linkup_name") || "You",
-    avatar: localStorage.getItem("linkup_avatar") || "",
-    bio: localStorage.getItem("linkup_bio") || "",
-    accent: localStorage.getItem("linkup_accent") || "#5865f2",
-    theme: localStorage.getItem("linkup_theme") || "dark",
-    manualLowData: localStorage.getItem("linkup_lowdata") === "1",
+    server: localStorage.getItem(LS.lastServer) || "main",
+    channel: localStorage.getItem(LS.lastChannel) || "general",
+    clientId: localStorage.getItem(LS.clientId) || ("cli_" + Math.random().toString(36).slice(2, 10)),
+    name: "You",
+    avatar: "",
+    bio: "",
+    accent: "#5865f2",
+    theme: "dark",
+    manualLowData: false,
     socket: null,
     seq: 0,
     typingTimer: null,
@@ -1862,7 +1563,7 @@ button,input,textarea,select{font:inherit}
     },
   };
 
-  localStorage.setItem("linkup_client_id", state.clientId);
+  localStorage.setItem(LS.clientId, state.clientId);
 
   const serverRail = el("servers");
   const channelRail = el("channels");
@@ -1912,6 +1613,72 @@ button,input,textarea,select{font:inherit}
 
   function flattenSearch(item) {
     return JSON.stringify(item).toLowerCase();
+  }
+
+  function loadLocal() {
+    try {
+      const rawProfile = localStorage.getItem(LS.profile);
+      const rawSettings = localStorage.getItem(LS.settings);
+      const rawRooms = localStorage.getItem(LS.rooms);
+
+      if (rawProfile) {
+        const p = JSON.parse(rawProfile);
+        state.name = p.name || state.name;
+        state.avatar = p.avatar || "";
+        state.bio = p.bio || "";
+        state.accent = p.accent || state.accent;
+      }
+
+      if (rawSettings) {
+        const s = JSON.parse(rawSettings);
+        state.theme = s.theme || state.theme;
+        state.manualLowData = !!s.manualLowData;
+      }
+
+      if (rawRooms) {
+        const cached = JSON.parse(rawRooms);
+        if (cached && cached[roomId()]) {
+          const room = cached[roomId()];
+          state.data.feed = Array.isArray(room.feed) ? room.feed : [];
+          state.data.messages = Array.isArray(room.messages) ? room.messages : [];
+          state.data.pins = Array.isArray(room.pins) ? room.pins : [];
+          state.data.users = Array.isArray(room.users) ? room.users : [];
+          state.data.trending = Array.isArray(room.trending) ? room.trending : [];
+        }
+      }
+    } catch {}
+  }
+
+  function saveLocal() {
+    try {
+      localStorage.setItem(
+        LS.profile,
+        JSON.stringify({
+          name: state.name,
+          avatar: state.avatar,
+          bio: state.bio,
+          accent: state.accent,
+        })
+      );
+      localStorage.setItem(
+        LS.settings,
+        JSON.stringify({
+          theme: state.theme,
+          manualLowData: state.manualLowData,
+        })
+      );
+
+      const existing = JSON.parse(localStorage.getItem(LS.rooms) || "{}");
+      existing[roomId()] = {
+        feed: state.data.feed,
+        messages: state.data.messages,
+        pins: state.data.pins,
+        users: state.data.users,
+        trending: state.data.trending,
+        savedAt: Date.now(),
+      };
+      localStorage.setItem(LS.rooms, JSON.stringify(existing));
+    } catch {}
   }
 
   function detectNetworkMode() {
@@ -1986,6 +1753,7 @@ button,input,textarea,select{font:inherit}
           renderFeed();
           renderMessages();
           renderTrending();
+          saveLocal();
         }
       });
     }
@@ -2027,9 +1795,10 @@ button,input,textarea,select{font:inherit}
     serverRail.querySelectorAll(".serverbtn").forEach((btn) => {
       btn.onclick = () => {
         state.server = btn.dataset.server;
-        localStorage.setItem("linkup_server", state.server);
+        localStorage.setItem(LS.lastServer, state.server);
         state.channel = "general";
-        localStorage.setItem("linkup_channel", state.channel);
+        localStorage.setItem(LS.lastChannel, state.channel);
+        loadLocal();
         renderAll();
         connect();
         closeDrawers();
@@ -2050,7 +1819,8 @@ button,input,textarea,select{font:inherit}
     channelRail.querySelectorAll(".channel").forEach((btn) => {
       btn.onclick = () => {
         state.channel = btn.dataset.channel;
-        localStorage.setItem("linkup_channel", state.channel);
+        localStorage.setItem(LS.lastChannel, state.channel);
+        loadLocal();
         renderAll();
         connect();
         closeDrawers();
@@ -2156,9 +1926,6 @@ button,input,textarea,select{font:inherit}
       `;
     }).join("");
     bindMessageActions();
-    if (state.tab === "chat") {
-      messagesList.scrollTop = messagesList.scrollHeight;
-    }
   }
 
   function renderMembers() {
@@ -2269,13 +2036,25 @@ button,input,textarea,select{font:inherit}
     renderTrending();
   }
 
+  function optimisticPatchFeed(postId, updater) {
+    const idx = state.data.feed.findIndex((p) => p.id === postId);
+    if (idx >= 0) {
+      state.data.feed[idx] = updater(state.data.feed[idx]);
+      saveLocal();
+      renderFeed();
+      renderTrending();
+    }
+  }
+
   function optimisticAddChat(msg) {
     state.data.messages.push(msg);
+    saveLocal();
     renderMessages();
   }
 
   function optimisticAddPost(post) {
     state.data.feed.unshift(post);
+    saveLocal();
     renderFeed();
     renderTrending();
   }
@@ -2306,6 +2085,33 @@ button,input,textarea,select{font:inherit}
     sidebar.classList.remove("open");
     rightbar.classList.remove("open");
     overlay.classList.remove("open");
+  }
+
+  function bindMobile() {
+    el("mobFeedBtn").onclick = () => {
+      state.tab = "feed";
+      renderTabs();
+      closeDrawers();
+    };
+
+    el("mobChatBtn").onclick = () => {
+      state.tab = "chat";
+      renderTabs();
+      closeDrawers();
+    };
+
+    el("mobChannelsBtn").onclick = () => openDrawer("channels");
+    el("mobSettingsBtn").onclick = () => openDrawer("settings");
+    el("mobPeopleBtn").onclick = () => openDrawer("people");
+    el("openChannelsBtn").onclick = () => openDrawer("channels");
+    el("openSettingsBtn").onclick = () => openDrawer("settings");
+    el("closeSidebarBtn").onclick = closeDrawers;
+    el("closeRightBtn").onclick = closeDrawers;
+    overlay.onclick = closeDrawers;
+
+    window.addEventListener("keydown", (e) => {
+      if (e.key === "Escape") closeDrawers();
+    });
   }
 
   function connect() {
@@ -2373,6 +2179,7 @@ button,input,textarea,select{font:inherit}
         state.data.feed = data.feed || [];
         state.data.trending = data.feed_trending || [];
         renderAll();
+        saveLocal();
         if (state.connectedOnce) setConn("connected");
         return;
       }
@@ -2380,6 +2187,7 @@ button,input,textarea,select{font:inherit}
       if (data.kind === "presence") {
         state.data.users = data.users || [];
         renderMembers();
+        saveLocal();
         return;
       }
 
@@ -2394,16 +2202,13 @@ button,input,textarea,select{font:inherit}
           state.avatar = p.avatar || state.avatar;
           state.bio = p.bio || state.bio;
           state.accent = p.accent || state.accent;
-          localStorage.setItem("linkup_name", state.name);
-          localStorage.setItem("linkup_avatar", state.avatar);
-          localStorage.setItem("linkup_bio", state.bio);
-          localStorage.setItem("linkup_accent", state.accent);
           renderSettingsFields();
           applyTheme();
         }
 
         renderMembers();
         renderTrending();
+        saveLocal();
         return;
       }
 
@@ -2411,16 +2216,18 @@ button,input,textarea,select{font:inherit}
         if (!state.data.messages.some((m) => m.msg_id === data.message.msg_id)) {
           state.data.messages.push(data.message);
           renderMessages();
+          saveLocal();
         }
         return;
       }
 
       if (data.kind === "pin_update") {
-        state.data.pins = (state.data.messages || []).filter((m) => m.pinned);
+        state.data.pins = state.data.messages.filter((m) => m.pinned);
         const m = state.data.messages.find((x) => x.msg_id === data.message?.msg_id);
         if (m) m.pinned = data.action === "pinned";
         renderPins();
         renderMessages();
+        saveLocal();
         return;
       }
 
@@ -2428,6 +2235,7 @@ button,input,textarea,select{font:inherit}
         const m = state.data.messages.find((x) => x.msg_id === data.msg_id);
         if (m) m.reactions = data.reactions || {};
         renderMessages();
+        saveLocal();
         return;
       }
 
@@ -2436,6 +2244,7 @@ button,input,textarea,select{font:inherit}
         state.data.trending = data.feed_trending || state.data.trending;
         renderFeed();
         renderTrending();
+        saveLocal();
         return;
       }
 
@@ -2444,6 +2253,7 @@ button,input,textarea,select{font:inherit}
           state.data.feed.unshift(data.post);
           renderFeed();
           renderTrending();
+          saveLocal();
         }
         return;
       }
@@ -2454,6 +2264,7 @@ button,input,textarea,select{font:inherit}
         else state.data.feed.unshift(data.post);
         renderFeed();
         renderTrending();
+        saveLocal();
         return;
       }
 
@@ -2480,6 +2291,7 @@ button,input,textarea,select{font:inherit}
           is_system: true,
         });
         renderMessages();
+        saveLocal();
         return;
       }
     };
@@ -2495,15 +2307,6 @@ button,input,textarea,select{font:inherit}
       setConn(state.connectedOnce ? "disconnected" : "offline");
       state.reconnectTimer = setTimeout(() => connect(), 1200);
     };
-  }
-
-  function optimisticPatchPost(postId, patchFn) {
-    const idx = state.data.feed.findIndex((p) => p.id === postId);
-    if (idx >= 0) {
-      state.data.feed[idx] = patchFn(state.data.feed[idx]);
-      renderFeed();
-      renderTrending();
-    }
   }
 
   function bindMessageActions() {
@@ -2537,12 +2340,26 @@ button,input,textarea,select{font:inherit}
         const act = btn.dataset.pact;
 
         if (act === "like") {
-          optimisticPatchPost(id, (post) => ({ ...post, likes: Math.max(0, (post.likes || 0) + (post._liked ? -1 : 1)), _liked: !post._liked }));
+          optimisticPatchFeed(id, (post) => {
+            const liked = !!post._liked;
+            return {
+              ...post,
+              likes: Math.max(0, (post.likes || 0) + (liked ? -1 : 1)),
+              _liked: !liked,
+            };
+          });
           return send("feed_like", { post_id: id });
         }
 
         if (act === "repost") {
-          optimisticPatchPost(id, (post) => ({ ...post, reposts: Math.max(0, (post.reposts || 0) + (post._reposted ? -1 : 1)), _reposted: !post._reposted }));
+          optimisticPatchFeed(id, (post) => {
+            const reposted = !!post._reposted;
+            return {
+              ...post,
+              reposts: Math.max(0, (post.reposts || 0) + (reposted ? -1 : 1)),
+              _reposted: !reposted,
+            };
+          });
           return send("feed_repost", { post_id: id });
         }
 
@@ -2559,7 +2376,7 @@ button,input,textarea,select{font:inherit}
             created_at: Date.now(),
           };
 
-          optimisticPatchPost(id, (post) => ({
+          optimisticPatchFeed(id, (post) => ({
             ...post,
             comments: [...(post.comments || []), comment],
           }));
@@ -2570,7 +2387,7 @@ button,input,textarea,select{font:inherit}
     });
   }
 
-  function renderProfileFields() {
+  function renderSettingsFields() {
     el("nameInput").value = state.name;
     el("avatarInput").value = state.avatar;
     el("bioInput").value = state.bio;
@@ -2636,13 +2453,25 @@ button,input,textarea,select{font:inherit}
     renderTrending();
   }
 
+  function optimisticPatchFeed(postId, updater) {
+    const idx = state.data.feed.findIndex((p) => p.id === postId);
+    if (idx >= 0) {
+      state.data.feed[idx] = updater(state.data.feed[idx]);
+      saveLocal();
+      renderFeed();
+      renderTrending();
+    }
+  }
+
   function optimisticAddChat(msg) {
     state.data.messages.push(msg);
+    saveLocal();
     renderMessages();
   }
 
   function optimisticAddPost(post) {
     state.data.feed.unshift(post);
+    saveLocal();
     renderFeed();
     renderTrending();
   }
@@ -2710,13 +2539,7 @@ button,input,textarea,select{font:inherit}
     state.accent = el("accentInput").value || "#5865f2";
     state.manualLowData = el("lowDataInput").checked;
 
-    localStorage.setItem("linkup_name", state.name);
-    localStorage.setItem("linkup_avatar", state.avatar);
-    localStorage.setItem("linkup_bio", state.bio);
-    localStorage.setItem("linkup_theme", state.theme);
-    localStorage.setItem("linkup_accent", state.accent);
-    localStorage.setItem("linkup_lowdata", state.manualLowData ? "1" : "0");
-
+    saveLocal();
     applyTheme();
     send("profile", { name: state.name, avatar: state.avatar, bio: state.bio, accent: state.accent });
     renderSettingsFields();
@@ -2727,7 +2550,7 @@ button,input,textarea,select{font:inherit}
   el("pickAvatarBtn").onclick = () => el("avatarFileInput").click();
   el("clearAvatarBtn").onclick = () => {
     state.avatar = "";
-    localStorage.removeItem("linkup_avatar");
+    saveLocal();
     renderSettingsFields();
     send("profile", { name: state.name, avatar: "", bio: state.bio, accent: state.accent });
   };
@@ -2750,7 +2573,7 @@ button,input,textarea,select{font:inherit}
 
     const dataUrl = await fileToDataURL(file);
     state.avatar = dataUrl;
-    localStorage.setItem("linkup_avatar", dataUrl);
+    saveLocal();
     renderSettingsFields();
     send("profile", { name: state.name, avatar: state.avatar, bio: state.bio, accent: state.accent });
     el("avatarFileInput").value = "";
@@ -2799,6 +2622,8 @@ button,input,textarea,select{font:inherit}
       likes: 0,
       reposts: 0,
       comments: [],
+      _liked: false,
+      _reposted: false,
     };
 
     optimisticAddPost(post);
@@ -2868,6 +2693,7 @@ button,input,textarea,select{font:inherit}
   });
 
   bindMobile();
+  loadLocal();
   bindNetworkSignals();
   renderAll();
   connect();
